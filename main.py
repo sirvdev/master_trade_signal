@@ -42,10 +42,18 @@ def _setup_logging(log_dir: str):
     for h in handlers:
         root.addHandler(h)
 
-    # Trade-specific logger
+    # Suppress noisy third-party loggers
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Trade-specific logger — writes to trades.log AND system.log
+    trade_log = logging.getLogger("trades")
+    trade_log.setLevel(logging.INFO)
     trade_handler = logging.FileHandler(f"{log_dir}/trades.log", encoding="utf-8")
     trade_handler.setFormatter(fmt)
-    logging.getLogger("trades").addHandler(trade_handler)
+    trade_log.addHandler(trade_handler)
+    trade_log.propagate = True   # also goes to root → system.log + console
 
 
 logger = logging.getLogger(__name__)

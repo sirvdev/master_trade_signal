@@ -89,6 +89,74 @@ class ParsedSignal:
     warnings:      list           = field(default_factory=list)
 
 
+def _regex_classify(text: str) -> Optional[dict]:
+    """
+    Fast regex-based pre-classifier for obvious signal patterns.
+    Returns a classification dict or None if the pattern is not recognised.
+    AI is only called when this returns None.
+
+    Covers:
+      - Full entry signals (SL + TP present in message)
+      - Bare "buy/sell now" pre-announcements
+      - Scouting ("looking for buys/sells")
+      - Breakeven, close, TP-hit keywords
+    """
+    t = text.strip()
+    tl = t.lower()
+
+    has_prices = bool(re.search(r'\b\d{4,5}(?:\.\d{1,2})?\b', t))
+    has_sl     = bool(re.search(r'\bsl\b|\bstop.?loss\b', tl))
+    has_tp     = bool(re.search(r'\btp\d*\b|\btake.?profit\b|✅', tl))
+    has_buy    = bool(re.search(r'\bbuy\b', tl))
+    has_sell   = bool(re.search(r'\bsell\b', tl))
+
+    direction = None
+    if has_buy and not has_sell:
+        direction = "buy"
+    elif has_sell and not has_buy:
+        direction = "sell"
+    elif has_sell and has_buy:
+        # "sell gold" / "buy gold" — whichever appears first
+        direction = "sell" if tl.index("sell") < tl.index("buy") else "buy"
+
+    # ── Scouting ──────────────────────────────────────────────────────────────
+    if re.search(r'\b(looking|watching|waiting|monitoring)\b.{0,30}\b(buy|sell|long|short)s?\b',
+                 tl) or \
+       re.search(r'\b(buy|sell)s?\b.{0,20}\b(looking|watching|waiting)\b', tl):
+        return {"type": "scouting", "direction": direction}
+
+    # ── Full entry signal ─────────────────────────────────────────────────────
+    # Must have: direction + prices + (SL or TP)
+    if direction and has_prices and (has_sl or has_tp):
+        return {"type": "entry", "direction": direction}
+
+    # ── Bare "buy/sell now" pre-announcement ──────────────────────────────────
+    # Short messages (< 40 chars) with direction and "now" / "gold" / "again"
+    # OR the message is just a short directional command
+    bare_triggers = r'\b(now|gold|again|immediately|quick|fast)\b'
+    if direction and not has_prices and re.search(bare_triggers, tl):
+        return {"type": "pre_announcement", "direction": direction}
+    # Very short pure directional: "buy", "sell", "buy now", "sell gold" etc.
+    if direction and len(t) <= 30 and not has_prices:
+        return {"type": "pre_announcement", "direction": direction}
+
+    # ── Breakeven ─────────────────────────────────────────────────────────────
+    if re.search(r'\bbreakeven\b|\bmove.{0,10}sl.{0,10}entry\b|\bsl.{0,10}be\b', tl):
+        return {"type": "breakeven", "direction": None}
+
+    # ── TP hit ────────────────────────────────────────────────────────────────
+    if re.search(r'\btp\s*\d+\s*(hit|done|reached|closed)\b|\b(hit|reached)\s*tp\s*\d+\b', tl):
+        return {"type": "tp_hit", "direction": None}
+
+    # ── Close ─────────────────────────────────────────────────────────────────
+    if re.search(r'\bclose\s+all\b|\bexit\s+all\b|\bclose\s+everything\b', tl):
+        return {"type": "close_all", "direction": None}
+    if re.search(r'\bclose\s+(this|it|now|trade|position)\b|\bexit\s+(now|trade)\b', tl):
+        return {"type": "close", "direction": None}
+
+    return None
+
+
 # ── AI Provider ───────────────────────────────────────────────────────────────
 
 _CLASSIFY_PROMPT = """You are an expert forex/gold trading signal analyst.
@@ -197,35 +265,55 @@ class AIParser:
                     default_symbol: str = "XAUUSD") -> ParsedSignal:
         sig = ParsedSignal(raw_text=text, is_reply=is_reply, reply_to_id=reply_to_id)
 
-        if self._active == "none":
+        # Step 1: Regex pre-filter — classify obvious patterns without AI.
+        # This prevents phi3 from hallucinating on simple messages and also
+        # catches cases where AI returns "unknown" for clear signals like "sell gold".
+        regex_result = _regex_classify(text)
+        if regex_result:
+            sig.signal_type = regex_result["type"]
+            sig.direction   = regex_result.get("direction")
+            sig.symbol      = regex_result.get("symbol") or default_symbol
+            sig.confidence  = 1.0
+            logger.info(f"[PARSER] REGEX-CLASSIFIED → {sig.signal_type} {sig.direction}")
+        elif self._active != "none":
+            # Step 2: AI classifies what regex couldn't
+            ai_result = await self._classify(text)
+            if not ai_result:
+                return sig
+
+            sig.signal_type = ai_result.get("type", "unknown")
+            sig.direction   = ai_result.get("direction") or None
+            sig.symbol      = ai_result.get("symbol") or default_symbol
+            sig.confidence  = float(ai_result.get("confidence", 0.7))
+
+            if sig.direction == "null":
+                sig.direction = None
+
+            # Guard: pre_announcement requires high confidence from AI.
+            # phi3 hallucinates on random chat messages at conf=0.70.
+            # Regex pre-filter above catches genuine bare signals — if AI
+            # thinks it's a pre_announcement but regex didn't, distrust it.
+            if sig.signal_type == "pre_announcement" and sig.confidence < 0.90:
+                logger.info(
+                    f"[PARSER] pre_announcement conf={sig.confidence:.2f} < 0.90 "
+                    f"— downgraded to unknown (text: {text[:60]!r})"
+                )
+                sig.signal_type = "unknown"
+
+        if sig.signal_type == "unknown":
             return sig
 
-        # Step 1: AI classifies intent
-        ai_result = await self._classify(text)
-        if not ai_result:
-            return sig
-
-        sig.signal_type = ai_result.get("type", "unknown")
-        sig.direction   = ai_result.get("direction") or None
-        sig.symbol      = ai_result.get("symbol") or default_symbol
-        sig.confidence  = float(ai_result.get("confidence", 0.7))
-
-        if sig.direction == "null":
-            sig.direction = None
-
-        # Step 2: Extract prices with regex
+        # Step 3: Extract prices with regex
         sig.stop_loss    = _extract_sl(text)
         sig.take_profits = _extract_tps(text)
         sig.entry_price  = _extract_entry(text)
 
-        # Step 3: Enrich based on type
+        # Step 4: Enrich based on type
         if sig.signal_type == "entry":
+            # Has SL or TPs → real entry. No levels → bare pre-announcement.
             if not sig.stop_loss and not sig.take_profits:
                 sig.signal_type = "pre_announcement"
-            elif sig.entry_price:
-                sig.entry_type = "limit"
-            else:
-                sig.entry_type = "market"
+            sig.entry_type = "market"  # always market — EA doesn't support limit orders
 
         if sig.signal_type == "tp_hit":
             m = re.search(r'tp\s*(\d+)', text, re.IGNORECASE)
@@ -235,7 +323,6 @@ class AIParser:
             prices = _extract_prices(text)
             sig.new_sl = prices[0] if prices else None
 
-        # Remove zero TPs (open runners)
         sig.take_profits = [tp for tp in sig.take_profits if tp > 0]
 
         logger.info(

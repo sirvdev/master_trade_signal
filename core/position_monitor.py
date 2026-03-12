@@ -15,7 +15,8 @@ from bridge.mt5_bridge import MT5FileBridge
 from config import AppConfig, ChannelConfig
 from db.database import Database
 
-logger = logging.getLogger(__name__)
+logger     = logging.getLogger(__name__)
+trades_log = logging.getLogger("trades")
 
 MONITOR_INTERVAL = 15  # seconds
 
@@ -92,6 +93,10 @@ class PositionMonitor:
 
         self.db.update_position_closed(ticket, pnl, reason)
         logger.info(f"[MONITOR] ticket={ticket} closed externally pnl={pnl:.2f} reason={reason}")
+        trades_log.info(
+            f"CLOSE ticket={ticket} signal={signal_id} channel={channel_id} "
+            f"pnl={pnl:.2f} reason={reason}"
+        )
 
         # Notify
         if self.notifier:

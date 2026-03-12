@@ -22,7 +22,8 @@ from config import ChannelConfig
 from core.ai_parser import ParsedSignal
 from db.database import Database
 
-logger = logging.getLogger(__name__)
+logger       = logging.getLogger(__name__)
+trades_log   = logging.getLogger("trades")   # writes to trades.log
 
 
 def _floor_lot(lot: float, step: float = 0.01, min_lot: float = 0.01) -> float:
@@ -109,18 +110,12 @@ class SignalExecutor:
             self.lot_step, self.min_lot
         )
 
-        # Classify TPs
-        market_used = len(upgraded)
-        classified  = []
+        # ALL TPs go market — EA only supports ORDER_TYPE_BUY / ORDER_TYPE_SELL
+        classified = []
         for i, tp in enumerate(tps, 1):
             if self._tp_passed(direction, price, tp):
                 logger.info(f"[EXECUTOR] TP{i} passed — skip"); continue
-            if market_used < 2:
-                classified.append((i, tp, "market", None))
-                market_used += 1
-            else:
-                implied = (tps[0] + 5.0) if direction == "sell" else (tps[0] - 5.0)
-                classified.append((i, tp, "limit", signal.entry_price or implied))
+            classified.append((i, tp))
 
         if not classified:
             if upgraded:
@@ -137,41 +132,42 @@ class SignalExecutor:
             channel_name=channel.name, message_id=message_id,
             reply_to_id=signal.reply_to_id, raw_text=signal.raw_text,
             symbol=symbol, direction=direction,
-            entry_type=signal.entry_type or "market",
+            entry_type="market",
             entry_price=signal.entry_price, stop_loss=sl,
             take_profits=tps, status="open"
         )
 
-        # Place orders
+        # Place all orders as market
         placed = []
-        for tp_index, tp_price, otype, lp in classified:
+        for tp_index, tp_price in classified:
             row_id = self.db.save_position(
                 signal_id=signal_id, channel_id=channel.id,
                 tp_index=tp_index, tp_price=tp_price,
-                lot_size=lot_per_tp, stop_loss=sl, order_type=otype
+                lot_size=lot_per_tp, stop_loss=sl, order_type="market"
             )
-            if otype == "market":
-                res = await self.bridge.place_market_order(
-                    symbol, direction, lot_per_tp, sl, tp_price,
-                    comment=f"sig_{channel.name[:8]}")
-            else:
-                res = await self.bridge.place_limit_order(
-                    symbol, direction, lot_per_tp, lp or price, sl, tp_price,
-                    comment=f"sigl_{channel.name[:7]}")
+            res = await self.bridge.place_market_order(
+                symbol, direction, lot_per_tp, sl, tp_price,
+                comment=f"sig_{channel.name[:8]}")
 
             if res and res.get("ticket"):
-                t = int(res["ticket"])
-                self.db.update_position_opened(row_id, t, res.get("price", price))
-                placed.append((tp_index, t, tp_price, otype))
+                t  = int(res["ticket"])
+                ep = res.get("price", price)
+                self.db.update_position_opened(row_id, t, ep)
+                placed.append((tp_index, t, tp_price))
                 logger.info(
-                    f"[EXECUTOR] ✅ TP{tp_index} ticket={t} {otype} "
+                    f"[EXECUTOR] ✅ TP{tp_index} ticket={t} market "
                     f"{direction} {symbol} lot={lot_per_tp:.2f}")
+                trades_log.info(
+                    f"OPEN signal={signal_id} channel={channel.name} "
+                    f"{direction.upper()} {symbol} TP{tp_index}={tp_price} "
+                    f"SL={sl} lot={lot_per_tp:.2f} ticket={t} price={ep}"
+                )
             else:
                 logger.error(f"[EXECUTOR] ❌ TP{tp_index} failed: {res}")
 
         arrow    = "🟢" if direction == "buy" else "🔴"
         tp_lines = "\n".join(
-            f"  TP{i}: <code>{tp:.2f}</code> [{ot}]" for i, _, tp, ot in placed)
+            f"  TP{i}: <code>{tp:.2f}</code>" for i, _, tp in placed)
         await self._notify(
             f"{arrow} <b>Signal Executed</b> — {channel.name}\n"
             f"<b>{direction.upper()} {symbol}</b>  ×{len(placed)} position(s)\n"
@@ -232,6 +228,10 @@ class SignalExecutor:
                 t = int(res["ticket"])
                 self.db.update_position_opened(row_id, t, res.get("price", 0.0))
                 opened.append(t)
+                trades_log.info(
+                    f"OPEN_BARE signal={signal_id} channel={channel.name} "
+                    f"{direction.upper()} {symbol} lot={self.min_lot} ticket={t}"
+                )
 
         self.db.update_signal_status(signal_id, "open" if opened else "failed")
         await self._notify(
@@ -294,6 +294,10 @@ class SignalExecutor:
                 if pos["ticket"]:
                     if await self.bridge.close_position(pos["ticket"]):
                         self.db.update_position_closed(pos["ticket"], 0.0, "manual")
+                        trades_log.info(
+                            f"CLOSE_MANUAL channel={channel.name} "
+                            f"ticket={pos['ticket']} signal={row['signal_id']}"
+                        )
                         closed += 1
             self.db.update_signal_status(row["signal_id"], "closed", "manual")
 
