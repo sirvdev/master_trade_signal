@@ -1,0 +1,20 @@
+# Signal Bot Dependencies
+# Install: pip install -r requirements.txt
+
+# Telegram
+telethon>=1.36.0
+python-telegram-bot>=21.0
+
+# HTTP client (AI providers + Ollama)
+httpx>=0.27.0
+
+# Dashboard
+streamlit>=1.35.0
+pandas>=2.0.0
+plotly>=5.0.0
+
+# Config
+python-dotenv>=1.0.0
+
+# Async utilities
+asyncio-throttle>=1.0.2
