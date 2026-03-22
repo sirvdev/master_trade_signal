@@ -110,8 +110,11 @@ class SignalExecutor:
             self.lot_step, self.min_lot
         )
 
-        # ALL TPs go market — EA only supports ORDER_TYPE_BUY / ORDER_TYPE_SELL
-        classified = []
+        # Classify TPs — market or limit based on signal.entry_type
+        entry_type  = signal.entry_type or "market"
+        entry_price = signal.entry_price   # limit price (None = use current for market)
+        classified  = []
+
         for i, tp in enumerate(tps, 1):
             if self._tp_passed(direction, price, tp):
                 logger.info(f"[EXECUTOR] TP{i} passed — skip"); continue
@@ -132,45 +135,54 @@ class SignalExecutor:
             channel_name=channel.name, message_id=message_id,
             reply_to_id=signal.reply_to_id, raw_text=signal.raw_text,
             symbol=symbol, direction=direction,
-            entry_type="market",
-            entry_price=signal.entry_price, stop_loss=sl,
+            entry_type=entry_type,
+            entry_price=entry_price, stop_loss=sl,
             take_profits=tps, status="open"
         )
 
-        # Place all orders as market
+        # Place all orders
         placed = []
         for tp_index, tp_price in classified:
             row_id = self.db.save_position(
                 signal_id=signal_id, channel_id=channel.id,
                 tp_index=tp_index, tp_price=tp_price,
-                lot_size=lot_per_tp, stop_loss=sl, order_type="market"
+                lot_size=lot_per_tp, stop_loss=sl, order_type=entry_type
             )
-            res = await self.bridge.place_market_order(
-                symbol, direction, lot_per_tp, sl, tp_price,
-                comment=f"sig_{channel.name[:8]}")
+
+            if entry_type == "limit" and entry_price:
+                res = await self.bridge.place_limit_order(
+                    symbol, direction, lot_per_tp, entry_price, sl, tp_price,
+                    comment=f"sigl_{channel.name[:7]}")
+                order_label = f"limit@{entry_price:.2f}"
+            else:
+                res = await self.bridge.place_market_order(
+                    symbol, direction, lot_per_tp, sl, tp_price,
+                    comment=f"sig_{channel.name[:8]}")
+                order_label = "market"
 
             if res and res.get("ticket"):
                 t  = int(res["ticket"])
-                ep = res.get("price", price)
+                ep = res.get("price", entry_price or price)
                 self.db.update_position_opened(row_id, t, ep)
-                placed.append((tp_index, t, tp_price))
+                placed.append((tp_index, t, tp_price, order_label))
                 logger.info(
-                    f"[EXECUTOR] ✅ TP{tp_index} ticket={t} market "
+                    f"[EXECUTOR] ✅ TP{tp_index} ticket={t} {order_label} "
                     f"{direction} {symbol} lot={lot_per_tp:.2f}")
                 trades_log.info(
                     f"OPEN signal={signal_id} channel={channel.name} "
                     f"{direction.upper()} {symbol} TP{tp_index}={tp_price} "
-                    f"SL={sl} lot={lot_per_tp:.2f} ticket={t} price={ep}"
+                    f"SL={sl} lot={lot_per_tp:.2f} ticket={t} price={ep} type={order_label}"
                 )
             else:
-                logger.error(f"[EXECUTOR] ❌ TP{tp_index} failed: {res}")
+                logger.error(f"[EXECUTOR] ❌ TP{tp_index} {order_label} failed: {res}")
 
         arrow    = "🟢" if direction == "buy" else "🔴"
+        etype    = f"limit@{entry_price:.2f}" if entry_type == "limit" and entry_price else "market"
         tp_lines = "\n".join(
-            f"  TP{i}: <code>{tp:.2f}</code>" for i, _, tp in placed)
+            f"  TP{i}: <code>{tp:.2f}</code>" for i, _, tp, _ in placed)
         await self._notify(
             f"{arrow} <b>Signal Executed</b> — {channel.name}\n"
-            f"<b>{direction.upper()} {symbol}</b>  ×{len(placed)} position(s)\n"
+            f"<b>{direction.upper()} {symbol}</b>  ×{len(placed)} position(s)  [{etype}]\n"
             f"  SL: <code>{sl:.2f}</code>\n{tp_lines}\n"
             f"  Lot each: <code>{lot_per_tp:.2f}</code>  "
             f"Risk: <code>{channel.risk_pct}%</code>\n"

@@ -50,6 +50,7 @@ class MT5FileBridge:
 
         # Demo state
         self._demo_positions: Dict[int, dict] = {}
+        self._demo_orders:    Dict[int, dict] = {}   # pending limit orders
         self._demo_counter   = 1000
 
     # ── Path detection ─────────────────────────────────────────────────────────
@@ -133,7 +134,7 @@ class MT5FileBridge:
             request_id = f"{self.session_id}_{self.request_counter}"
             command["request_id"] = request_id
 
-            cmd_file = self.common_path / f"python_command_{self.session_prefix}.txt"
+            cmd_file = self.common_path / f"python_command_{request_id}.txt"
             try:
                 cmd_file.write_text(json.dumps(command, ensure_ascii=True), encoding="utf-8")
             except Exception as e:
@@ -238,6 +239,18 @@ class MT5FileBridge:
             return resp.get("positions", [])
         return None
 
+    async def get_all_orders(self) -> Optional[list]:
+        """Returns all pending limit/stop orders placed by this EA."""
+        resp = await self._send_command({"action": "get_all_orders"})
+        if resp.get("status") == "success":
+            return resp.get("orders", [])
+        return None
+
+    async def cancel_order(self, ticket: int) -> bool:
+        """Cancels a pending limit order by ticket."""
+        resp = await self._send_command({"action": "cancel_order", "ticket": ticket})
+        return resp.get("status") == "success"
+
     async def get_position(self, ticket: int) -> Optional[dict]:
         resp = await self._send_command({"action": "get_position", "ticket": ticket})
         if resp.get("status") == "success":
@@ -261,8 +274,23 @@ class MT5FileBridge:
         if action == "place_order":
             ticket = self._demo_counter
             self._demo_counter += 1
-            self._demo_positions[ticket] = {**command, "ticket": ticket, "profit": 0.0}
-            return {"status": "success", "ticket": ticket, "price": 2000.0}
+            order_type = command.get("order_type", "")
+            is_pending = "LIMIT" in order_type or "STOP" in order_type
+            entry = {**command, "ticket": ticket, "profit": 0.0}
+            if is_pending:
+                self._demo_orders[ticket] = entry    # pending order
+            else:
+                self._demo_positions[ticket] = entry # live position
+            return {"status": "success", "ticket": ticket,
+                    "price": command.get("price", 2000.0)}
+        if action == "get_all_orders":
+            return {"status": "success", "orders": list(self._demo_orders.values())}
+        if action == "cancel_order":
+            ticket = command.get("ticket")
+            if ticket in self._demo_orders:
+                self._demo_orders.pop(ticket)
+                return {"status": "success", "ticket": ticket}
+            return {"status": "error", "error": "pending order not found"}
         if action == "modify_position":
             ticket = command.get("ticket")
             if ticket in self._demo_positions:
@@ -285,4 +313,3 @@ class MT5FileBridge:
             return {"status": "success", "exit_price": 2001.0, "profit": 1.0,
                     "volume": 0.01, "close_time": 0, "net_profit": 1.0}
         return {"status": "error", "error": f"unknown action: {action}"}
-    
