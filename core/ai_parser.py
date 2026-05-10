@@ -191,6 +191,9 @@ def _regex_classify(text: str) -> Optional[dict]:
     # "CLOSE ALL TARGET SUCCESSFULLY" = all TPs hit, not a close command
     if re.search(r'close\s+all\s+target|target\s+successfully', tl):
         return {"type": "tp_hit", "direction": direction}
+    # "Our 5th TP successfully hit" / "first TP successfully hit" — Marshal pattern
+    if re.search(r'\btp\b.{0,20}\bsuccessfully\s+hit\b', tl):
+        return {"type": "tp_hit", "direction": direction}
     # "TP5 with 150 pips done too" / "TP4 was 100 pips thats done"
     if re.search(r'\btp\d+\b.{0,20}\bpips\b.{0,10}\bdone\b', tl):
         return {"type": "tp_hit", "direction": direction}
@@ -203,9 +206,10 @@ def _regex_classify(text: str) -> Optional[dict]:
         return {"type": "scouting", "direction": direction}
 
     # ── Breakeven (command form only, not "breakeven hit" announcements) ──────
-    if re.search(r'\bset\s+(full\s+)?breakeven\b|\bsl\s+to\s+be\b|'
-                 r'\bmove\s+sl\s+to\s+(be|entry|breakeven)\b|'
-                 r'\bsl\s+to\s+entry\b', tl):
+    if re.search(r'\bset\s+(full\s+)?breakeven\b|'
+                 r'\b(sl|stop\s*loss)\s+to\s+(be|entry|breakeven|break\s*even)\b|'
+                 r'\bmove\s+(sl|stop\s*loss)\s+to\s+(be|entry|breakeven|break\s*even)\b',
+                 tl):
         return {"type": "breakeven", "direction": None}
     # "Breakeven hit" / "hit breakeven" → tp_hit (position closed at BE)
     if re.search(r'breakeven\s+hit|hit\s+breakeven|breakeven\s+now', tl) and \
@@ -218,25 +222,37 @@ def _regex_classify(text: str) -> Optional[dict]:
         return {"type": "close_all", "direction": None}
 
     # ── Close (individual) — be conservative ──────────────────────────────────
-    # Must be a SHORT message or a very clear close command
-    is_short = len(t.strip()) < 80
-    if is_short and re.search(
-        r'\bclosed?\s+(the\s+)?(trade|position|it|this|now)\.?\b|'
-        r'\bclose\s+(trade|this|it|now)\b|'
-        r"\bi'?ll?\s+cut\s+loss\s+now\b|"
-        r'\bcut\s+loss\s+now\b|'
-        r'\bclosing\s+trade\b',
-        tl
-    ) and not re.search(r'winner|profit\s+done|pips\s+done|target|together', tl):
+    is_short = len(t.strip()) < 100
+    close_patterns = [
+        r'\bclosed?\s+(?:the\s+)?(?:last|prior|previous|that)?\s*(?:trade|position|order|it|this|now)\b',
+        r"\bi'?ll?\s+cut\s+loss\s+now\b",
+        r'\bcut\s+loss\s+now\b',
+        r'\bclosing\s+(?:the\s+)?(?:trade|position|it)?\b',
+        r'\bclose\s+with\s+breakeven\b',  # Marshal: "Not good anymore close with breakeven"
+        r"don'?t\s+like\s+it.*?close",
+        r'\bexit\s+(?:the\s+)?(?:trade|position|it|now)\b',
+    ]
+    close_match = any(re.search(p, tl) for p in close_patterns)
+    if is_short and close_match and \
+       not re.search(r'winner|profit\s+done|pips\s+done|target|together|successfully', tl):
         return {"type": "close", "direction": None}
 
-    # ── SL correction (explicit standalone SL move to a price) ───────────────
-    if has_prices and re.search(
-        r'\b(adjust|move|set|moving|adjusting|max|update)\s+sl\b|'
-        r'\bsl\s+to\s+\d{4}|\bmoving\s+sl\b|\bstoploss\s+at\b|'
-        r'\bmove\s+stop\b|\badjust\s+stop\b',
-        tl
-    ) and not re.search(r'\btp\b|\btarget\b|\bentry\b', tl):
+    # ── SL correction (explicit standalone SL move to a price) ──────────────
+    sl_correction_patterns = [
+        r'\b(adjust|move|set|moving|adjusting|max|update|correct)\s+(?:the\s+)?(stop\s*loss|sl)\b',
+        r'\b(stop\s*loss|sl)\s+to\s+\d{4}',
+        r'\bmoving\s+(stop\s*loss|sl)\b',
+        r'\bstoploss\s+at\b',
+        r'\bmove\s+stop\b',
+        r'\b(correct|fix|update)\s+(?:the\s+)?stop\s*loss\b',
+        # Standalone "🛑 SL <price>" with no entry/TP context = correction
+        r'^[\s🛑]*sl\s+\d{4,5}\s*$',
+    ]
+    sl_correction_match = any(
+        re.search(p, tl, re.MULTILINE) for p in sl_correction_patterns
+    )
+    if has_prices and sl_correction_match and \
+       not re.search(r'\btp\b|\btarget\b|\bentry\b|\brisky\s+trade\b', tl):
         return {"type": "sl_correction", "direction": None}
 
     # ── Entry signal (has direction + prices + SL or TP) ─────────────────────
@@ -355,6 +371,7 @@ class AIParser:
             "claude":   "claude-haiku-4-5",
             "openai":   "gpt-4o-mini",
             "deepseek": "deepseek-chat",
+            "gemini":   "gemini-1.5-flash",
             "ollama":   "phi3",
         }.get(provider, "phi3")
 
@@ -420,7 +437,7 @@ class AIParser:
         normalised = _normalise(text)
 
         # Step 2: Regex pre-filter — handles all well-known channel patterns
-        regex_result = _regex_classify(text)
+        regex_result = _regex_classify(normalised)
         if regex_result:
             sig.signal_type = regex_result["type"]
             sig.direction   = regex_result.get("direction")
@@ -474,9 +491,12 @@ class AIParser:
             sig.tp_number = int(m.group(1)) if m else None
 
         if sig.signal_type == "sl_correction":
-            prices = _prices(normalised)
-            # Exclude SL price itself and take the corrective price
-            sig.new_sl = prices[0] if prices else None
+            # Prefer SL-keyword extraction first
+            sig.new_sl = _extract_sl(normalised)
+            if not sig.new_sl:
+                # Fallback to first 4-5 digit price
+                prices = _prices(normalised)
+                sig.new_sl = prices[0] if prices else None
 
         # Step 6: Remove zero / pips TPs (already filtered in _extract_tps,
         # but keep this as final guard)
@@ -514,6 +534,8 @@ class AIParser:
                 return await self._call_openai(prompt)
             elif provider == "deepseek":
                 return await self._call_deepseek(prompt)
+            elif provider == "gemini":
+                return await self._call_gemini(prompt)
             elif provider == "ollama":
                 return await self._call_ollama(prompt)
         except Exception as e:
@@ -566,6 +588,21 @@ class AIParser:
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
+
+    async def _call_gemini(self, prompt: str) -> Optional[str]:
+        """Google Gemini 1.5 Flash — free tier covers ~15 RPM."""
+        model = self.model or "gemini-1.5-flash"
+        resp = await self._client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={self.api_key}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 200, "temperature": 0.0},
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
     async def _call_ollama(self, prompt: str) -> Optional[str]:
         resp = await self._client.post(

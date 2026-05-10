@@ -88,17 +88,22 @@ class ChannelListener:
 
     async def _process_edit(self, msg: Message):
         """
-        Process edited messages — provider sometimes sends empty template first,
-        then edits in the actual prices. Only act if it looks like a real signal.
+        Process edited messages — only re-process if the edit added trade levels
+        that weren't there before. Idempotency in the executor will catch
+        duplicates from the same message_id.
         """
         if not msg or not msg.text:
             return
         text = msg.text.strip()
 
-        # Only act on edits that look like they contain prices (4+ digit numbers)
         import re
-        if not re.search(r'\b\d{4,5}\b', text):
+        has_prices = bool(re.search(r'\b\d{4,5}\b', text))
+        has_sl_or_tp = bool(re.search(r'\b(sl|stop\s*loss|tp|target|take\s*profit)\b',
+                                       text, re.IGNORECASE))
+
+        # Only re-process if the edit looks like it ADDED a trade plan
+        if not (has_prices and has_sl_or_tp):
             return
 
-        logger.info(f"[{self.channel.name}] Edited message — re-processing")
+        logger.info(f"[{self.channel.name}] Edited message {msg.id} — re-processing")
         await self._process(msg)

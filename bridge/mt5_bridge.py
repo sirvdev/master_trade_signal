@@ -144,7 +144,7 @@ class MT5FileBridge:
         # Poll for response file
         resp_file = self.common_path / f"python_response_{request_id}.txt"
         deadline  = asyncio.get_event_loop().time() + timeout
-        poll      = 0.05
+        poll      = 0.02
 
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(poll)
@@ -200,7 +200,7 @@ class MT5FileBridge:
             "sl":         sl,
             "tp":         tp or 0.0,
             "comment":    comment,
-        })
+        }, timeout=10.0)
 
     async def place_limit_order(self, symbol: str, direction: str,
                                  lot: float, price: float,
@@ -215,22 +215,38 @@ class MT5FileBridge:
             "sl":         sl,
             "tp":         tp or 0.0,
             "comment":    comment,
-        })
+        }, timeout=10.0)
 
     async def modify_position(self, ticket: int, sl: float, tp: float) -> bool:
+        # Get current position to validate SL direction
+        pos = await self.get_position(ticket)
+        if pos and sl > 0:
+            cur_price = float(pos.get("current_price") or pos.get("price_current") or 0)
+            pos_type = pos.get("type", "").lower()
+            if cur_price > 0:
+                if "buy" in pos_type and sl >= cur_price:
+                    logger.warning(
+                        f"[BRIDGE] Refusing modify ticket={ticket}: "
+                        f"buy SL {sl} >= current {cur_price}"
+                    )
+                    return False
+                if "sell" in pos_type and sl <= cur_price:
+                    logger.warning(
+                        f"[BRIDGE] Refusing modify ticket={ticket}: "
+                        f"sell SL {sl} <= current {cur_price}"
+                    )
+                    return False
+
         resp = await self._send_command({
-            "action": "modify_position",
-            "ticket": ticket,
-            "sl":     sl,
-            "tp":     tp,
-        })
+            "action": "modify_position", "ticket": ticket, "sl": sl, "tp": tp,
+        }, timeout=10.0)
         return resp.get("status") == "success"
 
     async def close_position(self, ticket: int, lot: Optional[float] = None) -> bool:
         cmd: Dict = {"action": "close_position", "ticket": ticket}
         if lot:
             cmd["lot_size"] = lot
-        resp = await self._send_command(cmd)
+        resp = await self._send_command(cmd, timeout=10.0)
         return resp.get("status") == "success"
 
     async def get_all_positions(self) -> Optional[list]:

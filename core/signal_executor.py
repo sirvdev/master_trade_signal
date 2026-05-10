@@ -43,6 +43,41 @@ class SignalExecutor:
         self.contract_size = float(os.getenv("CONTRACT_SIZE", "100.0"))
         self.magic         = int(os.getenv("SIGNAL_MAGIC",    "234567"))
 
+    # ── Working balance ────────────────────────────────────────────────────────
+
+    async def _get_working_balance(self, channel: ChannelConfig) -> Optional[float]:
+        """
+        Returns the balance to use for risk sizing.
+        - If channel.starting_balance == 0: returns live equity.
+        - Else: returns min(live_equity, system_balance), and warns if drift exceeds threshold.
+        """
+        equity = await self.bridge.get_equity()
+        if not equity:
+            return None
+
+        if channel.starting_balance <= 0:
+            return float(equity)
+
+        rec = self.db.get_system_balance(channel.id)
+        if not rec:
+            # First time — initialise
+            self.db.init_system_balance(channel.id, channel.starting_balance)
+            sys_bal = channel.starting_balance
+        else:
+            sys_bal = float(rec["system_balance"])
+
+        working = min(float(equity), sys_bal)
+
+        drift_pct = abs(float(equity) - sys_bal) / max(sys_bal, 1.0) * 100
+        if drift_pct > channel.balance_drift_pct:
+            await self._notify(
+                f"⚠️ <b>Balance drift</b> — {channel.name}\n"
+                f"Equity: <code>${equity:.2f}</code>  System: <code>${sys_bal:.2f}</code>  "
+                f"Drift: <code>{drift_pct:.1f}%</code>\n"
+                f"Sizing on <code>${working:.2f}</code> (the lower of the two)."
+            )
+        return working
+
     # ── Dispatch ───────────────────────────────────────────────────────────────
 
     async def execute(self, signal: ParsedSignal, channel: ChannelConfig,
@@ -76,6 +111,19 @@ class SignalExecutor:
 
     async def _handle_entry(self, signal: ParsedSignal, channel: ChannelConfig,
                               message_id: int):
+        # Idempotency: if this message_id already produced a non-bare signal, skip.
+        existing = self.db.get_signals_by_message(channel.id, message_id)
+        existing_full = [s for s in existing if not s["is_bare"]]
+        if existing_full:
+            logger.info(
+                f"[EXECUTOR] message_id={message_id} already has full signal "
+                f"{existing_full[0]['signal_id']} — skipping duplicate"
+            )
+            return
+
+        # If bare exists for same message_id, _upgrade_bare_trades will close it
+        # and we proceed normally.
+
         symbol    = signal.symbol or channel.symbol
         direction = signal.direction
         sl        = signal.stop_loss
@@ -95,20 +143,14 @@ class SignalExecutor:
         # Upgrade pending bare trades
         upgraded = await self._upgrade_bare_trades(channel, symbol, direction, sl, tps)
 
-        # Get equity + size lots
-        equity = await self.bridge.get_equity()
-        if not equity:
-            await self._notify("⚠️ Cannot read equity"); return
+        # Get working balance + size lots
+        working_balance = await self._get_working_balance(channel)
+        if not working_balance:
+            await self._notify("⚠️ Cannot read working balance"); return
 
         sl_dist = abs(price - sl)
         if sl_dist == 0:
             await self._notify("⚠️ SL distance is zero"); return
-
-        risk_amt   = equity * (channel.risk_pct / 100.0)
-        lot_per_tp = _floor_lot(
-            risk_amt / (sl_dist * self.contract_size * len(tps)),
-            self.lot_step, self.min_lot
-        )
 
         # Classify TPs — market or limit based on signal.entry_type
         entry_type  = signal.entry_type or "market"
@@ -127,6 +169,62 @@ class SignalExecutor:
             else:
                 await self._notify(f"⚠️ All TPs passed for {symbol}")
             return
+
+        # ── TP outlier check (typo guard) ──────────────────────────────────────
+        if len(classified) >= 2:
+            distances = [abs(price - tp) for _, tp in classified]
+            mean_dist = sum(distances) / len(distances)
+            outliers = [
+                (i, tp, abs(price - tp)) for i, tp in classified
+                if abs(abs(price - tp) - mean_dist) > 3 * mean_dist  # 3x off mean = clear typo
+            ]
+            if outliers:
+                await self._notify(
+                    f"⚠️ <b>TP outliers detected</b> — {channel.name}\n"
+                    f"Suspicious TPs (>3× off mean distance): "
+                    + ", ".join(f"TP{i}@{tp:.2f}" for i, tp, _ in outliers) +
+                    f"\nPlacing anyway — review the signal."
+                )
+
+        # ── Lot sizing — keep risk == risk_pct of working_balance ─────────────
+        risk_amt = working_balance * (channel.risk_pct / 100.0)
+        n_tps    = max(1, len(classified))
+        ideal_lot_per_tp = risk_amt / (sl_dist * self.contract_size * n_tps)
+
+        # Floor to lot_step but DON'T let min_lot silently inflate risk
+        floor_lot = math.floor(ideal_lot_per_tp / self.lot_step) * self.lot_step
+
+        if floor_lot < self.min_lot:
+            # Two strategies — pick (a) for now, document (b) in comments
+            # (a) reduce TP count to fit min_lot exactly
+            # (b) alternative would be to skip the trade entirely
+            max_tps_at_min = int(risk_amt / (sl_dist * self.contract_size * self.min_lot))
+            if max_tps_at_min < 1:
+                await self._notify(
+                    f"⚠️ <b>Account too small</b> — {channel.name}\n"
+                    f"Min risk per trade with min_lot: $"
+                    f"{self.min_lot * sl_dist * self.contract_size:.2f} "
+                    f"({self.min_lot * sl_dist * self.contract_size / working_balance * 100:.1f}% of "
+                    f"${working_balance:.2f}). Required risk_pct ({channel.risk_pct}%) too small. "
+                    f"Skipped to protect account."
+                )
+                return
+
+            # Take only first N TPs at min_lot to match target risk
+            n_tps_used = min(max_tps_at_min, n_tps)
+            classified = classified[:n_tps_used]
+            lot_per_tp = self.min_lot
+            actual_risk = lot_per_tp * sl_dist * self.contract_size * n_tps_used
+            await self._notify(
+                f"ℹ️ <b>Lot constraint</b> — {channel.name}: only opening "
+                f"{n_tps_used}/{n_tps} TPs at min_lot to keep risk at "
+                f"~${actual_risk:.2f} ({actual_risk/working_balance*100:.1f}% of working balance)."
+            )
+        else:
+            lot_per_tp = floor_lot
+
+        # Final guard — never exceed max_lot per position
+        lot_per_tp = min(lot_per_tp, self.max_lot)
 
         # Save signal
         signal_id = f"SIG-{message_id}-{uuid.uuid4().hex[:6].upper()}"
@@ -180,28 +278,42 @@ class SignalExecutor:
         etype    = f"limit@{entry_price:.2f}" if entry_type == "limit" and entry_price else "market"
         tp_lines = "\n".join(
             f"  TP{i}: <code>{tp:.2f}</code>" for i, _, tp, _ in placed)
+        actual_total_risk = lot_per_tp * sl_dist * self.contract_size * len(placed)
+        risk_msg = (f"  Total risk: <code>${actual_total_risk:.2f}</code> "
+                    f"({actual_total_risk/working_balance*100:.1f}% of working balance)\n")
         await self._notify(
             f"{arrow} <b>Signal Executed</b> — {channel.name}\n"
             f"<b>{direction.upper()} {symbol}</b>  ×{len(placed)} position(s)  [{etype}]\n"
             f"  SL: <code>{sl:.2f}</code>\n{tp_lines}\n"
             f"  Lot each: <code>{lot_per_tp:.2f}</code>  "
             f"Risk: <code>{channel.risk_pct}%</code>\n"
+            + risk_msg
             + (f"  ♻️ Upgraded {len(upgraded)} bare position(s)\n" if upgraded else "")
             + f"Signal: <code>{signal_id}</code>"
         )
 
     async def _upgrade_bare_trades(self, channel, symbol, direction, sl, tps) -> list:
+        """
+        Find pending bare trades for this channel/symbol/direction and upgrade them
+        to full signals: close the bare 0.01-lot positions and let the parent
+        _handle_entry function open the full sized batch.
+        """
         upgraded = []
-        for bare in self.db.get_bare_signals(channel.id):
-            if bare["symbol"] == symbol and bare["direction"] == direction:
-                target_tp = tps[min(2, len(tps) - 1)]
-                for pos in self.db.get_open_positions(bare["signal_id"]):
-                    if pos["ticket"]:
-                        ok = await self.bridge.modify_position(
-                            pos["ticket"], sl, target_tp)
-                        if ok:
-                            upgraded.append(pos["ticket"])
-                self.db.upgrade_bare_signal(bare["signal_id"], sl, tps)
+        bare_signals = self.db.get_bare_signals(channel.id)
+
+        for bs in bare_signals:
+            if bs["symbol"] != symbol or bs["direction"] != direction:
+                continue
+            # Close bare positions
+            for pos in self.db.get_open_positions(bs["signal_id"]):
+                if pos["ticket"]:
+                    if await self.bridge.close_position(pos["ticket"]):
+                        self.db.update_position_closed(
+                            pos["ticket"], 0.0, "upgraded_to_full")
+                        upgraded.append(pos["ticket"])
+            # Mark bare signal closed (the new full signal will create its own)
+            self.db.update_signal_status(bs["signal_id"], "closed", "upgraded")
+
         return upgraded
 
     # ── Pre-announcement ───────────────────────────────────────────────────────

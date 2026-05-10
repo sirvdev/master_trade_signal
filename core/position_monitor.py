@@ -9,6 +9,7 @@ Monitors all open MT5 positions.
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Optional
 
 from bridge.mt5_bridge import MT5FileBridge
@@ -18,7 +19,7 @@ from db.database import Database
 logger     = logging.getLogger(__name__)
 trades_log = logging.getLogger("trades")
 
-MONITOR_INTERVAL = 15  # seconds
+MONITOR_INTERVAL = 5  # seconds
 
 
 class PositionMonitor:
@@ -98,6 +99,11 @@ class PositionMonitor:
             f"pnl={pnl:.2f} reason={reason}"
         )
 
+        # Update channel system_balance with realized P&L
+        sig = self.db.get_signal(signal_id)
+        if sig and sig["channel_id"]:
+            self.db.update_system_balance(sig["channel_id"], pnl)
+
         # Notify
         if self.notifier:
             sig = self.db.get_signal(signal_id)
@@ -118,16 +124,31 @@ class PositionMonitor:
         if not equity:
             return
 
+        today = datetime.utcnow().date().isoformat()
+
         for ch in self.config.channels:
             if not ch.enabled:
                 continue
 
-            # Initialize starting equity for the day if not set
             today_stats = self.db.get_today_stats(ch.id)
-            if today_stats:
-                start_eq = float(today_stats["starting_equity"] or equity)
+
+            if today_stats and today_stats["date"] == today and \
+               today_stats["starting_equity"]:
+                # Use today's recorded starting equity
+                start_eq = float(today_stats["starting_equity"])
             else:
-                start_eq = equity
+                # First record of the day OR new day — initialise
+                # If we have a system_balance, prefer that (more reliable than
+                # raw equity which may include floating P&L).
+                sys_rec = self.db.get_system_balance(ch.id)
+                if sys_rec and ch.starting_balance > 0:
+                    start_eq = float(sys_rec["system_balance"])
+                else:
+                    start_eq = float(equity)
+                logger.info(
+                    f"[MONITOR] Initialising starting_equity for {ch.name} "
+                    f"on {today}: ${start_eq:.2f}"
+                )
 
             self.db.upsert_channel_equity(ch.id, equity, start_eq)
 

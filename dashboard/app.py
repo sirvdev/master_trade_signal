@@ -43,6 +43,7 @@ page = st.sidebar.radio("Navigate", [
     "📊 Overview",
     "📺 Live Positions",
     "⚙️ Channel Config",
+    "💰 Balances",
     "📈 Reports",
     "🏆 Performance",
     "📋 Logs",
@@ -162,11 +163,17 @@ elif page == "⚙️ Channel Config":
                 dd     = st.slider("Drawdown limit %",5.0, 50.0, ch.drawdown_pct,1.0, key=f"dd_{i}")
                 pre    = st.number_input("Pre-ann positions", 1, 5, ch.pre_ann_positions, key=f"pre_{i}")
                 enabled = st.checkbox("Enabled", ch.enabled, key=f"en_{i}")
+                start_bal = st.number_input("Starting balance ($, 0 = disabled)",
+                                             0.0, 1_000_000.0, ch.starting_balance,
+                                             step=10.0, key=f"sb_{i}")
+                drift = st.slider("Balance drift warning %", 1.0, 50.0,
+                                   ch.balance_drift_pct, 0.5, key=f"drift_{i}")
 
             updated.append(ChannelConfig(
                 id=ch_id, name=name, symbol=symbol,
                 risk_pct=risk, drawdown_pct=dd,
-                pre_ann_positions=int(pre), enabled=enabled
+                pre_ann_positions=int(pre), enabled=enabled,
+                starting_balance=start_bal, balance_drift_pct=drift,
             ))
 
     # Add new channel
@@ -186,7 +193,8 @@ elif page == "⚙️ Channel Config":
         updated.append(ChannelConfig(
             id=new_id, name=new_name, symbol=new_sym,
             risk_pct=new_risk, drawdown_pct=new_dd,
-            pre_ann_positions=int(new_pre), enabled=True
+            pre_ann_positions=int(new_pre), enabled=True,
+            starting_balance=0.0, balance_drift_pct=5.0,
         ))
         st.success(f"Channel '{new_name}' added")
 
@@ -195,6 +203,73 @@ elif page == "⚙️ Channel Config":
         cfg.channels = updated
         st.success("Saved to channels.json")
         st.cache_resource.clear()
+
+
+# ═══════════════════════════════════════════════════════════
+# Balances (system_balance ledger)
+# ═══════════════════════════════════════════════════════════
+elif page == "💰 Balances":
+    st.title("💰 Channel Balances")
+    st.caption("Per-channel system_balance ledger. Sizing uses min(equity, system_balance).")
+
+    if not cfg.channels:
+        st.info("No channels configured.")
+    else:
+        # Try to get live equity once (best-effort, no MT5 in dashboard process)
+        live_equity = None
+        try:
+            from bridge.mt5_bridge import MT5FileBridge  # noqa
+            # Dashboard runs in its own process — we cannot call async bridge here.
+            # Fall back to today's most recent equity stat.
+        except Exception:
+            pass
+
+        rows = []
+        for ch in cfg.channels:
+            rec = db.get_system_balance(ch.id)
+            today_stats = db.get_today_stats(ch.id)
+            cur_eq = float(today_stats["current_equity"]) if today_stats and today_stats["current_equity"] else None
+
+            if rec:
+                start_bal = rec["starting_balance"]
+                sys_bal   = rec["system_balance"]
+                last_upd  = rec["last_updated"]
+            else:
+                start_bal = ch.starting_balance
+                sys_bal   = None
+                last_upd  = "—"
+
+            drift = None
+            if sys_bal and cur_eq:
+                drift = abs(cur_eq - sys_bal) / max(sys_bal, 1.0) * 100
+
+            rows.append({
+                "Channel":          ch.name,
+                "Starting":         f"${start_bal:.2f}" if start_bal else "—",
+                "System Balance":   f"${sys_bal:.2f}" if sys_bal is not None else "(not initialised)",
+                "Account Equity":   f"${cur_eq:.2f}" if cur_eq is not None else "—",
+                "Drift %":          f"{drift:.2f}%" if drift is not None else "—",
+                "Last Updated":     str(last_upd)[:19],
+            })
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("Reset System Balance")
+        for i, ch in enumerate(cfg.channels):
+            today_stats = db.get_today_stats(ch.id)
+            cur_eq = float(today_stats["current_equity"]) if today_stats and today_stats["current_equity"] else 0.0
+            col_a, col_b, col_c = st.columns([3, 2, 2])
+            col_a.write(f"**{ch.name}**")
+            new_val = col_b.number_input(
+                f"New starting balance ($)",
+                0.0, 1_000_000.0,
+                value=float(cur_eq) if cur_eq > 0 else float(ch.starting_balance),
+                step=10.0, key=f"reset_val_{i}",
+            )
+            if col_c.button("Reset", key=f"reset_btn_{i}"):
+                db.reset_system_balance(ch.id, new_starting=float(new_val))
+                st.success(f"Reset {ch.name} system balance to ${new_val:.2f}")
 
 
 # ═══════════════════════════════════════════════════════════

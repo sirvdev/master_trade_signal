@@ -30,6 +30,10 @@ class ChannelConfig:
     drawdown_pct:        float = 20.0  # halt trading this channel at X% drawdown
     pre_ann_positions:   int   = 1     # positions to open on bare "buy/sell now"
     enabled:             bool  = True
+    # Optional working-balance ledger
+    starting_balance:    float = 0.0   # 0 = disabled (use live equity)
+    system_balance:      float = 0.0   # runtime tracking, not persisted in JSON
+    balance_drift_pct:   float = 5.0   # warn when |equity - system| > this %
     # per-channel drawdown tracking (runtime, not persisted in JSON)
     starting_equity:     float = 0.0
     current_drawdown:    float = 0.0
@@ -114,6 +118,8 @@ def _load_channels() -> list[ChannelConfig]:
                 drawdown_pct      = float(ch.get("drawdown_pct", 20.0)),
                 pre_ann_positions = int(ch.get("pre_ann_positions", 1)),
                 enabled           = bool(ch.get("enabled", True)),
+                starting_balance  = float(ch.get("starting_balance", 0.0)),
+                balance_drift_pct = float(ch.get("balance_drift_pct", 5.0)),
             ))
         logger.info(f"[CONFIG] Loaded {len(channels)} channel(s)")
         return channels
@@ -133,6 +139,8 @@ def save_channels(channels: list[ChannelConfig]):
                 "risk_pct":           ch.risk_pct,
                 "drawdown_pct":       ch.drawdown_pct,
                 "pre_ann_positions":  ch.pre_ann_positions,
+                "starting_balance":   ch.starting_balance,
+                "balance_drift_pct":  ch.balance_drift_pct,
                 "enabled":            ch.enabled,
             }
             for ch in channels

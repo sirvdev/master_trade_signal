@@ -85,6 +85,15 @@ class Database:
                     UNIQUE(channel_id, date)
                 );
 
+                CREATE TABLE IF NOT EXISTS channel_balances (
+                    channel_id      TEXT PRIMARY KEY,
+                    starting_balance REAL NOT NULL,
+                    system_balance  REAL NOT NULL,
+                    last_updated    TEXT NOT NULL,
+                    last_pnl        REAL DEFAULT 0,
+                    notes           TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_sig_channel
                     ON signals(channel_id, status);
                 CREATE INDEX IF NOT EXISTS idx_sig_symbol
@@ -268,6 +277,78 @@ class Database:
             return c.execute(
                 "SELECT * FROM channel_stats WHERE channel_id=? AND date=?",
                 (channel_id, today)).fetchone()
+
+    # ── System balance ledger ──────────────────────────────────────────────────
+
+    def get_system_balance(self, channel_id: str) -> Optional[dict]:
+        """Returns {'starting_balance', 'system_balance', 'last_updated'} or None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT starting_balance, system_balance, last_updated, last_pnl "
+                "FROM channel_balances WHERE channel_id=?",
+                (channel_id,)).fetchone()
+            if not row:
+                return None
+            return {
+                "starting_balance": float(row["starting_balance"]),
+                "system_balance":   float(row["system_balance"]),
+                "last_updated":     row["last_updated"],
+                "last_pnl":         float(row["last_pnl"] or 0.0),
+            }
+
+    def init_system_balance(self, channel_id: str, starting_balance: float):
+        """Insert if not exists. starting_balance also becomes initial system_balance."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as c:
+            c.execute("""
+                INSERT OR IGNORE INTO channel_balances
+                (channel_id, starting_balance, system_balance, last_updated, last_pnl)
+                VALUES (?, ?, ?, ?, 0.0)
+            """, (channel_id, float(starting_balance), float(starting_balance), now))
+
+    def update_system_balance(self, channel_id: str, pnl_delta: float):
+        """system_balance += pnl_delta, set last_updated=now, last_pnl=pnl_delta."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT system_balance FROM channel_balances WHERE channel_id=?",
+                (channel_id,)).fetchone()
+            if not row:
+                # Nothing to update — channel didn't opt in to ledger
+                return
+            new_bal = float(row["system_balance"]) + float(pnl_delta)
+            c.execute("""
+                UPDATE channel_balances
+                SET system_balance=?, last_updated=?, last_pnl=?
+                WHERE channel_id=?
+            """, (new_bal, now, float(pnl_delta), channel_id))
+
+    def reset_system_balance(self, channel_id: str, new_starting: float):
+        """Used when user manually resets via dashboard."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as c:
+            c.execute("""
+                INSERT INTO channel_balances
+                (channel_id, starting_balance, system_balance, last_updated, last_pnl, notes)
+                VALUES (?, ?, ?, ?, 0.0, 'manual reset')
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    starting_balance=excluded.starting_balance,
+                    system_balance=excluded.system_balance,
+                    last_updated=excluded.last_updated,
+                    last_pnl=0.0,
+                    notes='manual reset'
+            """, (channel_id, float(new_starting), float(new_starting), now))
+
+    # ── Lookups for idempotency (Task 6) ───────────────────────────────────────
+
+    def get_signals_by_message(self, channel_id: str, message_id: int) -> list:
+        """All signals (bare or full) for this exact message_id."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM signals WHERE channel_id=? AND message_id=? "
+                "AND status IN ('pending','open')",
+                (channel_id, message_id)
+            ).fetchall()
 
     # ── Reporting ──────────────────────────────────────────────────────────────
 

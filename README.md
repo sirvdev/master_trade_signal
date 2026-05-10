@@ -122,12 +122,14 @@ TELEGRAM_CHAT_ID=your_chat_id
 {
   "channels": [
     {
-      "id": "-1001234567890",
-      "name": "my_signal_channel",
+      "id": "-100xxxxxxxxxx",
+      "name": "marshal_500_to_100k",
       "symbol": "XAUUSD",
-      "risk_pct": 10.0,
-      "drawdown_pct": 20.0,
+      "risk_pct": 20.0,
+      "drawdown_pct": 60.0,
       "pre_ann_positions": 1,
+      "starting_balance": 500.0,
+      "balance_drift_pct": 5.0,
       "enabled": true
     }
   ]
@@ -142,6 +144,8 @@ TELEGRAM_CHAT_ID=your_chat_id
 | `risk_pct` | % of account equity risked per signal |
 | `drawdown_pct` | Channel halts when daily drawdown exceeds this % |
 | `pre_ann_positions` | How many positions to open on bare "buy now" signals |
+| `starting_balance` | Optional per-channel working balance ($, `0` = use live equity). When set, sizing uses `min(live_equity, system_balance)` as the working balance; realized P&L flows into `system_balance` and is persisted in the DB. |
+| `balance_drift_pct` | Notify when `\|equity - system_balance\|` exceeds this % (default 5%) |
 
 ---
 
@@ -168,6 +172,20 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 ## AI Provider Setup
 
 The system tries your configured provider at startup. If it fails, it automatically switches to Ollama.
+
+### Recommended providers for production
+
+For real money / high-risk challenges, **do not** use Ollama phi3 as the primary provider — it hallucinates on the `pre_announcement` class (the parser already has a confidence < 0.90 guard to mitigate this, but the cloud providers are much more reliable). Use one of:
+
+| Provider | Suggested model | Approx monthly cost (at typical channel volume) |
+|----------|-----------------|-------------------------------------------------|
+| **Claude** *(recommended)* | `claude-haiku-4-5` | ~$0.20 |
+| **Gemini** | `gemini-1.5-flash` | Free tier (15 RPM) |
+| OpenAI | `gpt-4o-mini` | ~$0.30 |
+| DeepSeek | `deepseek-chat` | ~$0.10 |
+| Ollama | `phi3` (fallback only) | Free (local) |
+
+Set `AI_PROVIDER=claude` or `AI_PROVIDER=gemini` in `.env` and supply the matching `AI_API_KEY`. Ollama remains the automatic fallback if the cloud provider is unavailable.
 
 ### Ollama (free, local)
 
@@ -201,6 +219,16 @@ AI_MODEL=gpt-4o-mini
 AI_PROVIDER=deepseek
 AI_API_KEY=your_key
 AI_MODEL=deepseek-chat
+```
+
+### Gemini (Google)
+
+Free tier covers ~15 requests per minute, more than enough for signal parsing. Get an API key at [aistudio.google.com](https://aistudio.google.com/apikey).
+
+```env
+AI_PROVIDER=gemini
+AI_API_KEY=your_google_api_key
+AI_MODEL=gemini-1.5-flash
 ```
 
 ---
@@ -251,6 +279,7 @@ with TelegramClient('tmp', API_ID, API_HASH) as client:
 | **Overview** | Summary metrics, channel status, drawdown progress, equity curve |
 | **Live Positions** | Table of all open positions with live P&L |
 | **Channel Config** | Add/edit/disable channels — saved to `channels.json` |
+| **Balances** | Per-channel `system_balance` ledger view — see starting balance, current ledger, account equity, drift %, and reset the system balance manually |
 | **Reports** | Date range + channel filter, equity curve, trade log, CSV export |
 | **Performance** | Per-channel ranking by win rate and P&L, highlights underperformers |
 | **Logs** | Live log viewer with search/filter |
@@ -261,7 +290,7 @@ with TelegramClient('tmp', API_ID, API_HASH) as client:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AI_PROVIDER` | `ollama` | AI provider: `claude`, `openai`, `deepseek`, `ollama` |
+| `AI_PROVIDER` | `claude` | AI provider: `claude`, `openai`, `deepseek`, `gemini`, `ollama` |
 | `AI_API_KEY` | — | API key for cloud providers |
 | `AI_MODEL` | *(provider default)* | Model override |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
