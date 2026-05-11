@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from bridge.mt5_bridge import MT5FileBridge
@@ -186,8 +187,26 @@ class SignalExecutor:
                     f"\nPlacing anyway — review the signal."
                 )
 
-        # ── Lot sizing — keep risk == risk_pct of working_balance ─────────────
-        risk_amt = working_balance * (channel.risk_pct / 100.0)
+        # ── Session-aware risk multiplier ─────────────────────────────────────
+        hour_utc = datetime.utcnow().hour
+        if 2 <= hour_utc < 7:
+            mult, session = channel.asian_risk_mult, "asian"
+        elif 7 <= hour_utc < 13:
+            mult, session = channel.london_risk_mult, "london"
+        elif 13 <= hour_utc < 21:
+            mult, session = channel.ny_risk_mult, "ny"
+        else:
+            mult, session = 1.0, "off-hours"
+        effective_risk_pct = channel.risk_pct * mult
+        if abs(mult - 1.0) > 1e-9:
+            logger.info(
+                f"[EXECUTOR] {channel.name}: {session} session multiplier "
+                f"{mult:.2f} → effective risk {effective_risk_pct:.2f}% "
+                f"(base {channel.risk_pct}%)"
+            )
+
+        # ── Lot sizing — keep risk == effective_risk_pct of working_balance ───
+        risk_amt = working_balance * (effective_risk_pct / 100.0)
         n_tps    = max(1, len(classified))
         ideal_lot_per_tp = risk_amt / (sl_dist * self.contract_size * n_tps)
 
@@ -205,7 +224,7 @@ class SignalExecutor:
                     f"Min risk per trade with min_lot: $"
                     f"{self.min_lot * sl_dist * self.contract_size:.2f} "
                     f"({self.min_lot * sl_dist * self.contract_size / working_balance * 100:.1f}% of "
-                    f"${working_balance:.2f}). Required risk_pct ({channel.risk_pct}%) too small. "
+                    f"${working_balance:.2f}). Required risk_pct ({effective_risk_pct:.2f}%) too small. "
                     f"Skipped to protect account."
                 )
                 return
@@ -226,6 +245,14 @@ class SignalExecutor:
         # Final guard — never exceed max_lot per position
         lot_per_tp = min(lot_per_tp, self.max_lot)
 
+        # ── Runner support ────────────────────────────────────────────────────
+        # If the signal includes "TP open" / "TP runner", append a synthetic
+        # position with tp_price=None — the bridge will open with SL only.
+        # NOTE: the runner adds ~1/n_tps additional risk on top of risk_pct
+        # because it shares lot_per_tp with the other positions.
+        if getattr(signal, "has_runner", False):
+            classified.append((len(classified) + 1, None))
+
         # Save signal
         signal_id = f"SIG-{message_id}-{uuid.uuid4().hex[:6].upper()}"
         self.db.save_signal(
@@ -241,13 +268,20 @@ class SignalExecutor:
         # Place all orders
         placed = []
         for tp_index, tp_price in classified:
+            is_runner = tp_price is None
             row_id = self.db.save_position(
                 signal_id=signal_id, channel_id=channel.id,
-                tp_index=tp_index, tp_price=tp_price,
+                tp_index=tp_index, tp_price=(0.0 if is_runner else tp_price),
                 lot_size=lot_per_tp, stop_loss=sl, order_type=entry_type
             )
 
-            if entry_type == "limit" and entry_price:
+            if is_runner:
+                # Runner: open with SL only, no TP (tp=0 = unlimited)
+                res = await self.bridge.place_market_order(
+                    symbol, direction, lot_per_tp, sl=sl, tp=0.0,
+                    comment=f"sig_{channel.name[:5]}_run")
+                order_label = "runner"
+            elif entry_type == "limit" and entry_price:
                 res = await self.bridge.place_limit_order(
                     symbol, direction, lot_per_tp, entry_price, sl, tp_price,
                     comment=f"sigl_{channel.name[:7]}")
@@ -263,30 +297,41 @@ class SignalExecutor:
                 ep = res.get("price", entry_price or price)
                 self.db.update_position_opened(row_id, t, ep)
                 placed.append((tp_index, t, tp_price, order_label))
+                tp_label = "RUNNER" if is_runner else f"TP{tp_index}"
+                tp_log   = "open" if is_runner else tp_price
                 logger.info(
-                    f"[EXECUTOR] ✅ TP{tp_index} ticket={t} {order_label} "
+                    f"[EXECUTOR] ✅ {tp_label} ticket={t} {order_label} "
                     f"{direction} {symbol} lot={lot_per_tp:.2f}")
                 trades_log.info(
                     f"OPEN signal={signal_id} channel={channel.name} "
-                    f"{direction.upper()} {symbol} TP{tp_index}={tp_price} "
+                    f"{direction.upper()} {symbol} {tp_label}={tp_log} "
                     f"SL={sl} lot={lot_per_tp:.2f} ticket={t} price={ep} type={order_label}"
                 )
             else:
-                logger.error(f"[EXECUTOR] ❌ TP{tp_index} {order_label} failed: {res}")
+                logger.error(f"[EXECUTOR] ❌ {'RUNNER' if is_runner else f'TP{tp_index}'} {order_label} failed: {res}")
 
         arrow    = "🟢" if direction == "buy" else "🔴"
         etype    = f"limit@{entry_price:.2f}" if entry_type == "limit" and entry_price else "market"
         tp_lines = "\n".join(
-            f"  TP{i}: <code>{tp:.2f}</code>" for i, _, tp, _ in placed)
+            (f"  RUNNER: <code>open</code>" if tp is None
+             else f"  TP{i}: <code>{tp:.2f}</code>")
+            for i, _, tp, _ in placed)
+        runner_count = sum(1 for _, _, tp, _ in placed if tp is None)
+        tp_count     = len(placed) - runner_count
+        runner_msg   = f" (+{runner_count} runner)" if runner_count else ""
         actual_total_risk = lot_per_tp * sl_dist * self.contract_size * len(placed)
         risk_msg = (f"  Total risk: <code>${actual_total_risk:.2f}</code> "
                     f"({actual_total_risk/working_balance*100:.1f}% of working balance)\n")
         await self._notify(
             f"{arrow} <b>Signal Executed</b> — {channel.name}\n"
-            f"<b>{direction.upper()} {symbol}</b>  ×{len(placed)} position(s)  [{etype}]\n"
+            f"<b>{direction.upper()} {symbol}</b>  ×{tp_count} TP position(s)"
+            f"{runner_msg}  [{etype}]\n"
             f"  SL: <code>{sl:.2f}</code>\n{tp_lines}\n"
             f"  Lot each: <code>{lot_per_tp:.2f}</code>  "
-            f"Risk: <code>{channel.risk_pct}%</code>\n"
+            f"Risk: <code>{effective_risk_pct:.2f}%</code>"
+            + (f" (base {channel.risk_pct}% × {mult:.2f} {session})"
+               if abs(mult - 1.0) > 1e-9 else "")
+            + "\n"
             + risk_msg
             + (f"  ♻️ Upgraded {len(upgraded)} bare position(s)\n" if upgraded else "")
             + f"Signal: <code>{signal_id}</code>"

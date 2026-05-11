@@ -8,7 +8,7 @@ import sys
 # Add project root to path so imports work when run from tests/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.ai_parser import AIParser, _regex_classify, _normalise
+from core.ai_parser import AIParser, _regex_classify, _normalise, _has_runner_tp
 
 CASES = [
     # (text, expected_type)
@@ -49,5 +49,27 @@ def test_regex_classifications():
     print(f"✅ {len(CASES)} parser cases pass")
 
 
+RUNNER_CASES = [
+    ("RiskY traDE ☠️\n👉🏾 buy XAUUSD now 4212\n🛑 SL 4198\n✅ TP 4217\n✅ TP open",
+     "entry", True),  # entry with runner
+    ("✅ TP 5081\n✅ TP open",
+     "entry", True),
+    ("✅ TP 5081\n✅ TP 5076",
+     None, False),  # not a complete signal — no SL
+]
+
+
+def test_runner_detection():
+    failures = []
+    for text, _, expected_runner in RUNNER_CASES:
+        actual = _has_runner_tp(text)
+        if actual != expected_runner:
+            failures.append(f"  ❌ {text[:50]!r}: expected runner={expected_runner}, got {actual}")
+    if failures:
+        raise AssertionError("\n".join(failures))
+    print(f"✅ {len(RUNNER_CASES)} runner cases pass")
+
+
 if __name__ == "__main__":
     test_regex_classifications()
+    test_runner_detection()

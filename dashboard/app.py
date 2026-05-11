@@ -169,11 +169,25 @@ elif page == "⚙️ Channel Config":
                 drift = st.slider("Balance drift warning %", 1.0, 50.0,
                                    ch.balance_drift_pct, 0.5, key=f"drift_{i}")
 
+            st.caption("Session risk multipliers (1.0 = no change)")
+            sm1, sm2, sm3 = st.columns(3)
+            with sm1:
+                asian_m  = st.slider("Asian (02-07 UTC)",  0.0, 2.0,
+                                      ch.asian_risk_mult,  0.05, key=f"am_{i}")
+            with sm2:
+                london_m = st.slider("London (07-13 UTC)", 0.0, 2.0,
+                                      ch.london_risk_mult, 0.05, key=f"lm_{i}")
+            with sm3:
+                ny_m     = st.slider("NY (13-21 UTC)",     0.0, 2.0,
+                                      ch.ny_risk_mult,     0.05, key=f"nm_{i}")
+
             updated.append(ChannelConfig(
                 id=ch_id, name=name, symbol=symbol,
                 risk_pct=risk, drawdown_pct=dd,
                 pre_ann_positions=int(pre), enabled=enabled,
                 starting_balance=start_bal, balance_drift_pct=drift,
+                asian_risk_mult=asian_m, london_risk_mult=london_m,
+                ny_risk_mult=ny_m,
             ))
 
     # Add new channel
@@ -195,6 +209,7 @@ elif page == "⚙️ Channel Config":
             risk_pct=new_risk, drawdown_pct=new_dd,
             pre_ann_positions=int(new_pre), enabled=True,
             starting_balance=0.0, balance_drift_pct=5.0,
+            asian_risk_mult=1.0, london_risk_mult=1.0, ny_risk_mult=1.0,
         ))
         st.success(f"Channel '{new_name}' added")
 
@@ -253,6 +268,25 @@ elif page == "💰 Balances":
             })
 
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("30-Day Win Rate")
+        for ch in cfg.channels:
+            st.markdown(f"**{ch.name}**")
+            wr = db.get_channel_winrate(ch.id, days=30)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("30-day WR", f"{wr['wr_pct']:.1f}%")
+            col2.metric("Wins", wr['wins'])
+            col3.metric("Losses", wr['losses'])
+            col4.metric("Scratches", wr['scratches'])
+
+            # Warning if WR drops below survival threshold for high-risk channels
+            if ch.risk_pct >= 15 and wr['total'] >= 10 and wr['wr_pct'] < 63:
+                st.warning(
+                    f"⚠️ Win rate {wr['wr_pct']:.1f}% is below the ~63% survival "
+                    f"threshold for {ch.risk_pct}% risk. Account will lose money "
+                    f"in expectation if this rate continues."
+                )
 
         st.markdown("---")
         st.subheader("Reset System Balance")

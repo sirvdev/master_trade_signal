@@ -339,6 +339,40 @@ class Database:
                     notes='manual reset'
             """, (channel_id, float(new_starting), float(new_starting), now))
 
+    # ── Performance ────────────────────────────────────────────────────────────
+
+    def get_channel_winrate(self, channel_id: str, days: int = 30) -> dict:
+        """Returns {wins, losses, scratches, total, wr_pct} for a channel."""
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+        with self._conn() as c:
+            # Wins = at least one position closed via TP for the signal
+            rows = c.execute("""
+                SELECT s.signal_id,
+                       SUM(CASE WHEN p.close_reason='tp' THEN 1 ELSE 0 END) AS tp_count,
+                       SUM(CASE WHEN p.close_reason='sl' THEN 1 ELSE 0 END) AS sl_count,
+                       SUM(CASE WHEN p.close_reason IN ('manual','be','upgraded_to_full')
+                                THEN 1 ELSE 0 END) AS scratch_count
+                FROM signals s
+                LEFT JOIN positions p ON p.signal_id = s.signal_id
+                WHERE s.channel_id = ?
+                  AND s.created_at >= ?
+                  AND s.status = 'closed'
+                GROUP BY s.signal_id
+            """, (channel_id, cutoff)).fetchall()
+
+        wins = sum(1 for r in rows if (r["tp_count"] or 0) > 0)
+        losses = sum(1 for r in rows if (r["tp_count"] or 0) == 0
+                                         and (r["sl_count"] or 0) > 0)
+        scratches = sum(1 for r in rows if (r["tp_count"] or 0) == 0
+                                            and (r["sl_count"] or 0) == 0
+                                            and (r["scratch_count"] or 0) > 0)
+        total = wins + losses + scratches
+        wr_pct = (wins / total * 100) if total > 0 else 0.0
+        return {"wins": wins, "losses": losses, "scratches": scratches,
+                "total": total, "wr_pct": wr_pct}
+
     # ── Lookups for idempotency (Task 6) ───────────────────────────────────────
 
     def get_signals_by_message(self, channel_id: str, message_id: int) -> list:

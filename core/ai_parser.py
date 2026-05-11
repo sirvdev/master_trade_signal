@@ -115,6 +115,15 @@ def _extract_tps(text: str) -> list[float]:
             tps.append(v)
     return tps
 
+
+def _has_runner_tp(text: str) -> bool:
+    """True if the signal includes 'TP open' / 'TP runner' / 'last TP open'."""
+    return bool(re.search(
+        r'(?:✅\s*)?tp\s*(?:open|runner|run)\b',
+        text, re.IGNORECASE
+    ))
+
+
 def _extract_entry(text: str, direction: Optional[str] = None) -> Optional[float]:
     """
     Extract entry price. Handles:
@@ -315,6 +324,7 @@ class ParsedSignal:
     entry_type:    Optional[str]   = None     # "market" | "limit"
     stop_loss:     Optional[float] = None
     take_profits:  list            = field(default_factory=list)
+    has_runner:    bool            = False    # True if "TP open" / "TP runner" present
     tp_number:     Optional[int]   = None
     new_sl:        Optional[float] = None
     confidence:    float           = 1.0
@@ -478,10 +488,11 @@ class AIParser:
         sig.stop_loss    = _extract_sl(normalised)
         sig.take_profits = _extract_tps(normalised)
         sig.entry_price  = _extract_entry(normalised, sig.direction)
+        sig.has_runner   = _has_runner_tp(normalised)
 
         # Step 5: Type-specific enrichment
         if sig.signal_type == "entry":
-            if not sig.stop_loss and not sig.take_profits:
+            if not sig.stop_loss and not sig.take_profits and not sig.has_runner:
                 # Has direction but no levels → treat as bare trade
                 sig.signal_type = "pre_announcement"
             # entry_type already set by classifier

@@ -34,6 +34,10 @@ class ChannelConfig:
     starting_balance:    float = 0.0   # 0 = disabled (use live equity)
     system_balance:      float = 0.0   # runtime tracking, not persisted in JSON
     balance_drift_pct:   float = 5.0   # warn when |equity - system| > this %
+    # Session-aware risk multipliers (1.0 = no change)
+    asian_risk_mult:     float = 1.0   # 02-07 UTC
+    london_risk_mult:    float = 1.0   # 07-13 UTC
+    ny_risk_mult:        float = 1.0   # 13-21 UTC
     # per-channel drawdown tracking (runtime, not persisted in JSON)
     starting_equity:     float = 0.0
     current_drawdown:    float = 0.0
@@ -120,6 +124,9 @@ def _load_channels() -> list[ChannelConfig]:
                 enabled           = bool(ch.get("enabled", True)),
                 starting_balance  = float(ch.get("starting_balance", 0.0)),
                 balance_drift_pct = float(ch.get("balance_drift_pct", 5.0)),
+                asian_risk_mult   = float(ch.get("asian_risk_mult", 1.0)),
+                london_risk_mult  = float(ch.get("london_risk_mult", 1.0)),
+                ny_risk_mult      = float(ch.get("ny_risk_mult", 1.0)),
             ))
         logger.info(f"[CONFIG] Loaded {len(channels)} channel(s)")
         return channels
@@ -141,6 +148,9 @@ def save_channels(channels: list[ChannelConfig]):
                 "pre_ann_positions":  ch.pre_ann_positions,
                 "starting_balance":   ch.starting_balance,
                 "balance_drift_pct":  ch.balance_drift_pct,
+                "asian_risk_mult":    ch.asian_risk_mult,
+                "london_risk_mult":   ch.london_risk_mult,
+                "ny_risk_mult":       ch.ny_risk_mult,
                 "enabled":            ch.enabled,
             }
             for ch in channels
