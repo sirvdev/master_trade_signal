@@ -222,15 +222,28 @@ class MT5FileBridge:
         pos = await self.get_position(ticket)
         if pos and sl > 0:
             cur_price = float(pos.get("current_price") or pos.get("price_current") or 0)
-            pos_type = pos.get("type", "").lower()
+            # MT5 returns position type as int (0=BUY, 1=SELL) but the demo
+            # bridge and some EAs return strings like "ORDER_TYPE_BUY".
+            # Normalise both forms to a buy/sell flag.
+            raw_type = pos.get("type")
+            if isinstance(raw_type, bool):
+                is_buy, is_sell = False, False  # unknown
+            elif isinstance(raw_type, int):
+                is_buy  = raw_type == 0
+                is_sell = raw_type == 1
+            else:
+                pos_type = str(raw_type or "").lower()
+                is_buy  = "buy" in pos_type
+                is_sell = "sell" in pos_type
+
             if cur_price > 0:
-                if "buy" in pos_type and sl >= cur_price:
+                if is_buy and sl >= cur_price:
                     logger.warning(
                         f"[BRIDGE] Refusing modify ticket={ticket}: "
                         f"buy SL {sl} >= current {cur_price}"
                     )
                     return False
-                if "sell" in pos_type and sl <= cur_price:
+                if is_sell and sl <= cur_price:
                     logger.warning(
                         f"[BRIDGE] Refusing modify ticket={ticket}: "
                         f"sell SL {sl} <= current {cur_price}"

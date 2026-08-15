@@ -339,25 +339,40 @@ class SignalExecutor:
 
     async def _upgrade_bare_trades(self, channel, symbol, direction, sl, tps) -> list:
         """
-        Find pending bare trades for this channel/symbol/direction and upgrade them
-        to full signals: close the bare 0.01-lot positions and let the parent
-        _handle_entry function open the full sized batch.
+        Marshal posts "sell/buy now" to enter early while he types the rest of
+        the signal. When the full details arrive we MODIFY the bare positions
+        in place (add SL + a target TP) so the early entry rides the trade —
+        we do NOT close them. The full-sized batch for all TPs is opened on
+        top of the modified bare(s) by the caller.
+
+        Returns the list of bare tickets that were successfully modified.
         """
         upgraded = []
-        bare_signals = self.db.get_bare_signals(channel.id)
+        # Pick a mid-TP for the bare to aim at (TP3 if available, else last).
+        target_tp = tps[min(2, len(tps) - 1)] if tps else 0.0
 
-        for bs in bare_signals:
-            if bs["symbol"] != symbol or bs["direction"] != direction:
+        for bare in self.db.get_bare_signals(channel.id):
+            if bare["symbol"] != symbol or bare["direction"] != direction:
                 continue
-            # Close bare positions
-            for pos in self.db.get_open_positions(bs["signal_id"]):
-                if pos["ticket"]:
-                    if await self.bridge.close_position(pos["ticket"]):
-                        self.db.update_position_closed(
-                            pos["ticket"], 0.0, "upgraded_to_full")
-                        upgraded.append(pos["ticket"])
-            # Mark bare signal closed (the new full signal will create its own)
-            self.db.update_signal_status(bs["signal_id"], "closed", "upgraded")
+            for pos in self.db.get_open_positions(bare["signal_id"]):
+                if not pos["ticket"]:
+                    continue
+                ok = await self.bridge.modify_position(
+                    pos["ticket"], sl, target_tp)
+                if ok:
+                    upgraded.append(pos["ticket"])
+                    logger.info(
+                        f"[EXECUTOR] Upgraded bare ticket={pos['ticket']} "
+                        f"sl={sl} tp={target_tp}"
+                    )
+                else:
+                    logger.warning(
+                        f"[EXECUTOR] Failed to modify bare ticket={pos['ticket']} "
+                        f"sl={sl} tp={target_tp} — leaving as-is"
+                    )
+            # Mark the bare signal as upgraded (status='open' so position_monitor
+            # keeps tracking it through to close).
+            self.db.upgrade_bare_signal(bare["signal_id"], sl, tps)
 
         return upgraded
 

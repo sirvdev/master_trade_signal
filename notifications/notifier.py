@@ -55,6 +55,13 @@ class Notifier:
             f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
         )
 
+    async def notify_alive(self, interval_minutes: int = 15) -> bool:
+        return await self.send(
+            f"🤖 <b>Bot Alive</b>\n"
+            f"Heartbeat every {interval_minutes}m\n"
+            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
     async def notify_shutdown(self) -> bool:
         return await self.send(
             f"🔴 <b>Signal Bot Stopped</b>\n"

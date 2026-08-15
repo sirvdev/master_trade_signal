@@ -6,7 +6,9 @@ Starts all async loops via asyncio.gather.
 """
 
 import asyncio
+import contextlib
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -57,6 +59,17 @@ def _setup_logging(log_dir: str):
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _heartbeat_loop(notifier: Notifier, interval_minutes: int):
+    while True:
+        try:
+            await asyncio.sleep(interval_minutes * 60)
+            await notifier.notify_alive(interval_minutes)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[MAIN] Heartbeat failed: %s", e)
 
 
 async def main():
@@ -125,6 +138,13 @@ async def main():
 
     # Notify startup
     await notifier.notify_startup(active_provider, enabled_channels)
+    await notifier.notify_alive(15)
+
+    heartbeat_interval = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "15"))
+    heartbeat_task = None
+    if heartbeat_interval > 0:
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(notifier, heartbeat_interval))
+        logger.info(f"Telegram heartbeat enabled every {heartbeat_interval} minute(s)")
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
     loop = asyncio.get_event_loop()
@@ -159,6 +179,10 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt")
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         await notifier.notify_shutdown()
         await bridge.disconnect()
         logger.info("Shutdown complete")
