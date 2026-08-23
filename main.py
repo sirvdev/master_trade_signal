@@ -140,7 +140,7 @@ async def main():
     await notifier.notify_startup(active_provider, enabled_channels)
     await notifier.notify_alive(15)
 
-    heartbeat_interval = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "15"))
+    heartbeat_interval = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "15000"))
     heartbeat_task = None
     if heartbeat_interval > 0:
         heartbeat_task = asyncio.create_task(_heartbeat_loop(notifier, heartbeat_interval))

@@ -234,6 +234,24 @@ class Database:
                 "SELECT * FROM positions WHERE signal_id=? AND status='open'",
                 (signal_id,)).fetchall()
 
+    def update_position_sl(self, ticket: int, sl: float):
+        """Record a stop that was moved on the broker side (runner trailing)."""
+        with self._conn() as c:
+            c.execute("UPDATE positions SET stop_loss=? WHERE ticket=?",
+                      (sl, ticket))
+
+    def get_positions_by_signal(self, signal_id: str) -> list:
+        """Every position for a signal, open or closed.
+
+        get_open_positions() only returns the open ones, which cannot answer
+        "have the other take-profit legs been reached yet" — the question the
+        runner's trailing stop depends on.
+        """
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM positions WHERE signal_id=?",
+                (signal_id,)).fetchall()
+
     def get_position_by_ticket(self, ticket: int) -> Optional[sqlite3.Row]:
         with self._conn() as c:
             return c.execute(
@@ -375,14 +393,20 @@ class Database:
 
     # ── Lookups for idempotency (Task 6) ───────────────────────────────────────
 
-    def get_signals_by_message(self, channel_id: str, message_id: int) -> list:
-        """All signals (bare or full) for this exact message_id."""
+    def get_signals_by_message(self, channel_id: str, message_id: int,
+                                any_status: bool = False) -> list:
+        """All signals (bare or full) for this exact message_id.
+
+        any_status=True is what the entry idempotency check needs. Restricting
+        to pending/open meant that once a signal had closed, an edit of the same
+        message was no longer recognised as already traded and opened the whole
+        position a second time.
+        """
+        sql = "SELECT * FROM signals WHERE channel_id=? AND message_id=?"
+        if not any_status:
+            sql += " AND status IN ('pending','open')"
         with self._conn() as c:
-            return c.execute(
-                "SELECT * FROM signals WHERE channel_id=? AND message_id=? "
-                "AND status IN ('pending','open')",
-                (channel_id, message_id)
-            ).fetchall()
+            return c.execute(sql, (channel_id, message_id)).fetchall()
 
     # ── Reporting ──────────────────────────────────────────────────────────────
 

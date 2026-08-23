@@ -217,6 +217,54 @@ class MT5FileBridge:
             "comment":    comment,
         }, timeout=10.0)
 
+    async def place_stop_order(self, symbol: str, direction: str,
+                                lot: float, price: float,
+                                sl: float, tp: float,
+                                comment: str = "signal_stop") -> Optional[dict]:
+        """Breakout entry: buy stop rests ABOVE the market, sell stop BELOW.
+
+        Requires PythonFileBridge v2.503+. Earlier builds answer
+        "Invalid order type" because they only implement the two limit types.
+        """
+        return await self._send_command({
+            "action":     "place_order",
+            "symbol":     symbol,
+            "order_type": "ORDER_TYPE_BUY_STOP" if direction == "buy" else "ORDER_TYPE_SELL_STOP",
+            "price":      price,
+            "volume":     lot,
+            "sl":         sl,
+            "tp":         tp or 0.0,
+            "comment":    comment,
+        }, timeout=10.0)
+
+    async def get_symbol_info(self, symbol: str) -> Optional[dict]:
+        """Broker's real spec for a symbol. Requires PythonFileBridge v2.505+."""
+        return await self._send_command({
+            "action": "get_symbol_info", "symbol": symbol,
+        }, timeout=10.0)
+
+    async def set_trailing(self, ticket: int, distance: float,
+                            step: float = 0.0) -> Optional[dict]:
+        """Hand a position to the EA's trailing engine.
+
+        Python decides WHEN to arm, because only it knows whether the rest of
+        the take-profit ladder has been reached. The EA then does the tracking
+        on its 100 ms timer. Trailing from here instead meant a 5 s poll across
+        a file bridge, which on gold leaves the stop seconds and dollars behind
+        price and defeats the point.
+
+        Requires PythonFileBridge v2.504+.
+        """
+        return await self._send_command({
+            "action": "set_trailing", "ticket": ticket,
+            "distance": distance, "step": step,
+        }, timeout=10.0)
+
+    async def clear_trailing(self, ticket: int) -> Optional[dict]:
+        return await self._send_command({
+            "action": "clear_trailing", "ticket": ticket,
+        }, timeout=10.0)
+
     async def modify_position(self, ticket: int, sl: float, tp: float) -> bool:
         # Get current position to validate SL direction
         pos = await self.get_position(ticket)

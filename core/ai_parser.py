@@ -40,6 +40,7 @@ Channel patterns observed and handled:
 import asyncio
 import json
 import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -331,12 +332,29 @@ class ParsedSignal:
     is_reply:      bool            = False
     reply_to_id:   Optional[int]   = None
     warnings:      list            = field(default_factory=list)
+    # Fraction to close for signal_type="close_partial" (0.5 = half).
+    # Set by core/signal_adapter.py; ai_parser never populates it.
+    close_fraction: Optional[float] = None
+    # Posted entry ZONE, when the operator gave a range rather than one price.
+    # The parser always knew these; they simply never reached the executor, so a
+    # "buy 4333-4339" collapsed to a single price and the range was discarded.
+    entry_low:     Optional[float] = None
+    entry_high:    Optional[float] = None
+    is_zone:       bool            = False
 
 
 # ── AI classify prompt ────────────────────────────────────────────────────────
 
 _CLASSIFY_PROMPT = """You are an expert forex/gold trading signal analyst.
-Classify this Telegram message from a gold/forex trading channel.
+Classify one Telegram message from a specific gold/forex signal channel.
+{channel_hint}
+IMPORTANT CONTEXT ABOUT WHAT YOU ARE SEEING.
+A deterministic parser already ran on this message and ABSTAINED. It handles
+every well-formed template this channel uses, so a message reaching you is one
+of: an unusual phrasing, a broken or partial post, member conversation, or
+marketing. Assume "unknown" and require the message to argue you out of it.
+You are NOT asked for any price. Prices are extracted deterministically and
+your answer is never used to set an entry, a stop or a target.
 
 Message: "{text}"
 
@@ -348,15 +366,78 @@ Classify into EXACTLY one type:
 - tp_hit: a take profit level was hit or confirmed
 - close: close the most recent position
 - close_all: close all open positions
+- close_partial: close PART of a position ("close half", "take partials", "close 50%")
+- cancel_pending: delete unfilled limit/pending orders ("cancel all buys", "cancel the template")
 - sl_correction: standalone new stop loss price for existing open trade
 - unknown: chatter, general info, testimonials, community messages — not actionable
 
+Decision rules that matter more than the wording:
+- A message DESCRIBING what already happened is a report, not an order.
+  "I closed mine", "all closed in profit", "TP2 done" are tp_hit or unknown,
+  never close or close_all.
+- A question is never an instruction, even if it contains an imperative verb.
+- An optional suggestion ("you can close half if you like") is unknown.
+- Marketing, results screenshots, testimonials and recruitment are unknown,
+  however many prices they contain.
+- If you are not sure between an actionable type and unknown, answer unknown.
+
 For direction: buy, sell, or null
-For symbol: extract if mentioned, default XAUUSD
+For symbol: extract if mentioned, default {default_symbol}
 For entry_type: market (enter now) or limit (enter at a specific level)
+Set confidence honestly. Anything that closes, cancels or moves a stop is acted
+on with real money, and below {destructive_floor:.2f} confidence it is discarded.
 
 Reply ONLY with valid JSON, no explanation:
-{{"type": "...", "direction": "buy|sell|null", "symbol": "XAUUSD", "entry_type": "market|limit", "confidence": 0.95}}"""
+{{"type": "...", "direction": "buy|sell|null", "symbol": "{default_symbol}", "entry_type": "market|limit", "confidence": 0.95}}"""
+
+
+# Classifications that move money on positions that already exist. An AI that
+# hallucinates one of these does immediate damage, so they carry a floor.
+# "entry" is not in this set: it goes through the executor's own SL/TP/lot gates.
+_DESTRUCTIVE_TYPES = {"close", "close_all", "close_partial",
+                      "cancel_pending", "sl_correction", "breakeven"}
+
+
+def build_channel_hint(channel_name: str, parser_cfg: dict) -> str:
+    """Turn a channels.json `parser` block into prompt context for ONE channel.
+
+    The AI classifies far better when it knows the house style: what a signal
+    from this operator looks like, what their exit phrasing is, and what they
+    never post. All of it already lives in channels.json.
+    """
+    p = parser_cfg or {}
+    lines = [f'\nCHANNEL: "{channel_name}".']
+
+    if p.get("template"):
+        lines.append(f"Its signal template: {p['template']}.")
+    if p.get("example"):
+        lines.append(f"A real signal from it: {p['example']!r}.")
+
+    hint = p.get("ai_hint")
+    if isinstance(hint, list):
+        hint = " ".join(str(x) for x in hint)
+    if hint:
+        lines.append(str(hint))
+
+    if p.get("follow_conditional_close"):
+        lines.append("On this channel the exit instruction is normally phrased "
+                     "conditionally ('close now and set breakeven if you wish to "
+                     "hold'). Here that IS a genuine close, not a suggestion.")
+    else:
+        lines.append("On this channel a conditional or optional phrasing "
+                     "('you can close', 'if you want') is NOT an instruction.")
+
+    if p.get("assemble_window_sec"):
+        lines.append("This operator sometimes splits one trade across several "
+                     "consecutive posts, so a message with only a direction, or "
+                     "only a stop, may be a fragment rather than a full signal.")
+
+    # _risk_notes is deliberately NOT injected. It is written for whoever
+    # maintains this repo ("normalize() handles both", "the geometry gate
+    # rejects it", "do not enable"), and instructions about code the model
+    # cannot see make its job harder, not easier. Put anything the model
+    # should know in `ai_hint`, phrased for a reader who only sees the message.
+    return "\n".join(lines) + "\n"
 
 
 # ── AI Parser ─────────────────────────────────────────────────────────────────
@@ -375,6 +456,8 @@ class AIParser:
         self.ollama_model  = ollama_model
         self._active       = provider
         self._client       = httpx.AsyncClient(timeout=20.0)
+        # Confidence floor for AI classifications that act on open positions.
+        self.destructive_floor = float(os.getenv("AI_DESTRUCTIVE_FLOOR", "0.90"))
 
     def _default_model(self, provider: str) -> str:
         return {
@@ -439,7 +522,8 @@ class AIParser:
 
     async def parse(self, text: str, is_reply: bool = False,
                     reply_to_id: Optional[int] = None,
-                    default_symbol: str = "XAUUSD") -> ParsedSignal:
+                    default_symbol: str = "XAUUSD",
+                    channel_hint: str = "") -> ParsedSignal:
 
         sig = ParsedSignal(raw_text=text, is_reply=is_reply, reply_to_id=reply_to_id)
 
@@ -459,7 +543,8 @@ class AIParser:
 
         elif self._active != "none":
             # Step 3: AI classifies what regex couldn't
-            ai_result = await self._classify(normalised)
+            ai_result = await self._classify(normalised, channel_hint,
+                                             default_symbol)
             if not ai_result:
                 return sig
 
@@ -478,6 +563,19 @@ class AIParser:
                 logger.info(
                     f"[PARSER] pre_announcement conf={sig.confidence:.2f} < 0.90 "
                     f"→ downgraded to unknown  ({normalised[:60]!r})"
+                )
+                sig.signal_type = "unknown"
+
+            # Guard: anything that closes, cancels or moves a stop acts on money
+            # that is already at risk. The AI only ever sees messages the
+            # deterministic layer abstained on, which is exactly the population
+            # where a confident-sounding hallucination is most likely.
+            if sig.signal_type in _DESTRUCTIVE_TYPES \
+                    and sig.confidence < self.destructive_floor:
+                logger.info(
+                    f"[PARSER] {sig.signal_type} conf={sig.confidence:.2f} < "
+                    f"{self.destructive_floor:.2f} → downgraded to unknown "
+                    f"({normalised[:60]!r})"
                 )
                 sig.signal_type = "unknown"
 
@@ -520,8 +618,12 @@ class AIParser:
         )
         return sig
 
-    async def _classify(self, text: str) -> Optional[dict]:
-        prompt = _CLASSIFY_PROMPT.format(text=text[:500])
+    async def _classify(self, text: str, channel_hint: str = "",
+                        default_symbol: str = "XAUUSD") -> Optional[dict]:
+        prompt = _CLASSIFY_PROMPT.format(
+            text=text[:500], channel_hint=channel_hint,
+            default_symbol=default_symbol,
+            destructive_floor=self.destructive_floor)
         try:
             raw = await self._call_provider(self._active, prompt)
             if not raw:
