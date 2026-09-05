@@ -50,7 +50,12 @@ def order_comment(channel_id: str, signal_id: str = "", leg: str = "") -> str:
         parts.append(frag[:6])
     if leg:
         parts.append(leg[:4])
-    return "|".join(parts)[:31]
+    # NOT '|'. get_all_orders is the one EA reply that echoes this string back,
+    # and the bridge used to treat a pipe as a record separator, so every
+    # comment written here shredded the orders reply and the orders pool read
+    # as permanently unavailable. The bridge no longer splits on pipes, but
+    # putting a delimiter character inside a payload is a trap either way.
+    return "-".join(parts)[:31]
 
 
 def _floor_lot(lot: float, step: float = 0.01, min_lot: float = 0.01) -> float:
@@ -83,6 +88,13 @@ class SignalExecutor:
         # Fingerprint -> time, for the same trade arriving as several messages.
         self._recent_trades: dict[tuple, float] = {}
         self.duplicate_window_sec = int(os.getenv("DUPLICATE_WINDOW_SEC", "600"))
+        # Cross-channel mirror NOTICE. Off by default, by operator decision:
+        # every channel keeps its own system_balance and is being graded
+        # against the others, so a trade several channels relay is several
+        # independent results and must be executed every time. It never
+        # blocked anything even when on — set MIRROR_WINDOW_SEC to a positive
+        # number of seconds if you ever want the heads-up back.
+        self.mirror_window_sec = int(os.getenv("MIRROR_WINDOW_SEC", "0"))
 
     @staticmethod
     def _trade_fingerprint(channel_id, symbol, direction, sl, tps) -> tuple:
@@ -370,6 +382,71 @@ class SignalExecutor:
                 f"Window: {self.duplicate_window_sec}s "
                 f"(<code>DUPLICATE_WINDOW_SEC</code>).")
             return
+        # ── Idempotency, layer 4: the same trade is STILL LIVE ───────────────
+        # Layer 3 expires after duplicate_window_sec, which is correct for a
+        # market order: an hour later, with the first trade closed, a repost is
+        # a genuine new trade. It is wrong for a pending order that never
+        # filled. On 2026-08-24 Gold Hunter reposted the same buy limit @4643
+        # 49 minutes later and the same @4621.74 eleven hours later; both times
+        # the original was still sitting unfilled and a second identical order
+        # went on top of it. This asks whether the trade is live, not how long
+        # ago we saw it.
+        live = None
+        try:
+            live = self.db.find_live_duplicate(channel.id, direction, sl, tps,
+                                               exclude_message_id=message_id)
+        except Exception as e:
+            logger.debug("[EXECUTOR] live-duplicate check unavailable: %s", e)
+        if live is not None:
+            self._recent_trades.pop(fp, None)
+            logger.warning(
+                "[EXECUTOR] %s: %s %s (SL %s, TPs %s) is already live as %s "
+                "from message %s — refusing the repost from message %s",
+                channel.name, direction.upper(), symbol, sl, tps,
+                live["signal_id"], live["message_id"], message_id)
+            await self._notify(
+                f"🔁 <b>Repost of a live trade</b> — {channel.name}\n"
+                f"The same {direction.upper()} {symbol} "
+                f"(SL <code>{sl}</code>) is still "
+                f"{'pending' if str(live['entry_type']) != 'market' else 'open'}"
+                f" from msg {live['message_id']}.\n"
+                f"msg {message_id} not executed.")
+            return
+
+        # ── Mirror channels: NOTICE ONLY, and off by default ─────────────────
+        # Several enabled channels relay the same desk. Every one of them still
+        # trades it, always: each channel carries its own system_balance and is
+        # being graded against the others, so the same setup arriving on four
+        # channels is four independent results, not one duplicated. Their
+        # entries also diverge in practice — the four channels that relayed the
+        # 2026-08-25 07:34 SELL 4636 opened 0.06, 0.04, 0.04 and 0.03 lots at
+        # different moments, which is exactly the difference being measured.
+        #
+        # Nothing below this line can refuse a trade. It is a heads-up, and it
+        # is disabled unless MIRROR_WINDOW_SEC is set to a positive value.
+        if self.mirror_window_sec > 0:
+            try:
+                mirrors = self.db.find_mirror_signals(
+                    channel.id, direction, sl, tps, self.mirror_window_sec)
+            except Exception:
+                mirrors = []
+            if mirrors:
+                names = ", ".join(dict.fromkeys(m["channel_name"] for m in mirrors))
+                logger.warning(
+                    "[EXECUTOR] MIRROR: %s posted the same %s %s (SL %s) "
+                    "already posted by %s within %ds — taking it again",
+                    channel.name, direction.upper(), symbol, sl, names,
+                    self.mirror_window_sec)
+                await self._notify(
+                    f"👯 <b>Mirror signal</b> — {channel.name}\n"
+                    f"The same {direction.upper()} {symbol} "
+                    f"(SL <code>{sl}</code>) was already taken from "
+                    f"<b>{names}</b> in the last "
+                    f"{self.mirror_window_sec // 60} min.\n"
+                    f"Trading it anyway (that is what the measurement week is "
+                    f"for). This desk's opinion is now on "
+                    f"<b>{len(mirrors) + 1}</b> channels.")
+
         self._recent_trades[fp] = now
         if fp_holder is not None:
             fp_holder.append(fp)
@@ -568,7 +645,15 @@ class SignalExecutor:
             if res and res.get("ticket"):
                 self._last_entry_placed = True
                 t  = int(res["ticket"])
-                ep = res.get("price", entry_price or price)
+                # A pending order has no fill price yet and the EA reports
+                # price 0.0 for one. dict.get returns that 0.0 rather than the
+                # default, which is how every limit order ended up recorded
+                # with entry_price=0.0 — and entry_price 0 makes _auto_breakeven
+                # and the ladder anchor skip the leg silently.
+                ep = res.get("price") or 0.0
+                if not ep:
+                    ep = (leg_entry if leg_entry is not None
+                          else entry_price) or price
                 self.db.update_position_opened(row_id, t, ep)
                 placed.append((tp_index, t, tp_price, order_label))
                 tp_label = "RUNNER" if is_runner else f"TP{tp_index}"
@@ -622,14 +707,41 @@ class SignalExecutor:
         Returns the list of bare tickets that were successfully modified.
         """
         upgraded = []
-        # Pick a mid-TP for the bare to aim at (TP3 if available, else last).
-        target_tp = tps[min(2, len(tps) - 1)] if tps else 0.0
+        price = await self.bridge.get_price(symbol, direction)
 
         for bare in self.db.get_bare_signals(channel.id):
             if bare["symbol"] != symbol or bare["direction"] != direction:
                 continue
             for pos in self.db.get_open_positions(bare["signal_id"]):
                 if not pos["ticket"]:
+                    continue
+                # Aim at the nearest target price has NOT already gone through.
+                # This used to take tps[2] blindly. On 2026-08-28 Forex Expert
+                # Team posted "Gold sell now" and then a full signal whose TP1,
+                # TP2 and TP3 the market had already passed; the upgrade asked
+                # the broker for TP 4595 on a sell filled at 4590.94 — a target
+                # on the WRONG SIDE of the fill. The modify was rejected, the
+                # bare kept its own wide protective stop, and it stopped out.
+                # Twice in three minutes, -19.70.
+                fill = float(pos["entry_price"] or 0) or (price or 0)
+                live = [t for t in (tps or [])
+                        if not self._tp_passed(direction, fill, t)]
+                if not live:
+                    logger.info(
+                        "[EXECUTOR] bare ticket=%s: every posted target is "
+                        "already behind the fill at %s — leaving its own stop "
+                        "in place rather than sending an invalid one",
+                        pos["ticket"], fill)
+                    continue
+                target_tp = live[0]
+                # A stop on the wrong side of the fill is rejected too, and
+                # would be a market order if it were not.
+                if fill and sl and self._tp_passed(direction, fill, sl):
+                    logger.warning(
+                        "[EXECUTOR] bare ticket=%s: the signal's stop %s is "
+                        "already through the fill at %s — keeping the "
+                        "protective stop it opened with",
+                        pos["ticket"], sl, fill)
                     continue
                 ok = await self.bridge.modify_position(
                     pos["ticket"], sl, target_tp)
@@ -652,6 +764,16 @@ class SignalExecutor:
 
     # ── Pre-announcement ───────────────────────────────────────────────────────
 
+    # Protective stop for a blind entry, in pips. 100 pips = $10 on gold with
+    # pip_value 0.1. Wide enough that ordinary noise does not take it, narrow
+    # enough that the loss is bounded while waiting for levels that arrive
+    # only about 59% of the time. Per channel: parser.pre_signal_sl_pips.
+    # Protective stop for a bare call, in pips, when the channel does not set
+    # its own pre_signal_sl_pips. Matches defaults.parser.default_sl_pips so a
+    # bare call and an unreadable stop are handled with one number rather than
+    # two that can drift apart.
+    PRE_SIGNAL_SL_PIPS_DEFAULT = 70.0
+
     async def _handle_pre_announcement(self, signal: ParsedSignal,
                                         channel: ChannelConfig, message_id: int):
         symbol    = signal.symbol or channel.symbol
@@ -660,15 +782,50 @@ class SignalExecutor:
             return
 
         emoji     = "📢🟢" if direction == "buy" else "📢🔴"
-        signal_id = f"BARE-{message_id}-{uuid.uuid4().hex[:6].upper()}"
 
+        # A repeat of a bare call while the first one is still open is the
+        # operator saying the same thing twice, not a second trade. Jason Noah
+        # posted "Scalping buy gold slowly high risk" 119 times in the corpus.
+        # find_live_duplicate cannot see these: it filters is_bare=0.
+        try:
+            live_bare = [s for s in self.db.get_bare_signals(channel.id)
+                         if str(s["direction"]).lower() == direction.lower()
+                         and s["status"] in ("pending", "open")]
+        except Exception:
+            live_bare = []
+        if live_bare:
+            logger.info(
+                "[EXECUTOR] %s: a bare %s is already open (%s) — not opening "
+                "another for message %s",
+                channel.name, direction.upper(), live_bare[0]["signal_id"],
+                message_id)
+            return
+
+        # A blind position with no stop is an unbounded loss waiting for an
+        # instruction that arrives 41% of the time. Give it a real stop at a
+        # distance wide enough not to be noise and narrow enough to be a stop.
+        p = channel.parser or {}
+        pip = float(p.get("pip_value", 0.1))
+        sl_pips = float(p.get("pre_signal_sl_pips",
+                              self.PRE_SIGNAL_SL_PIPS_DEFAULT))
+        price = await self.bridge.get_price(symbol, direction)
+        if not price:
+            await self._notify(
+                f"⚠️ Pre-signal — {channel.name}: no price for {symbol}, "
+                f"cannot place a protective stop. Not opening blind.")
+            return
+        sl = (price - sl_pips * pip) if direction == "buy" \
+            else (price + sl_pips * pip)
+        sl = round(sl, 3)
+
+        signal_id = f"BARE-{message_id}-{uuid.uuid4().hex[:6].upper()}"
         self.db.save_signal(
             signal_id=signal_id, channel_id=channel.id,
             channel_name=channel.name, message_id=message_id,
             reply_to_id=None, raw_text=signal.raw_text,
             symbol=symbol, direction=direction,
             entry_type="market", entry_price=None,
-            stop_loss=None, take_profits=[],
+            stop_loss=sl, take_profits=[],
             status="pending", is_bare=True
         )
 
@@ -677,26 +834,37 @@ class SignalExecutor:
             row_id = self.db.save_position(
                 signal_id=signal_id, channel_id=channel.id,
                 tp_index=i + 1, tp_price=0.0,
-                lot_size=self.min_lot, stop_loss=0.0, order_type="market"
+                lot_size=self.min_lot, stop_loss=sl, order_type="market"
             )
             res = await self.bridge.place_market_order(
-                symbol, direction, self.min_lot, sl=0.0, tp=0.0,
+                symbol, direction, self.min_lot, sl=sl, tp=0.0,
                 comment=order_comment(channel.id, signal_id, "bare"))
             if res and res.get("ticket"):
                 t = int(res["ticket"])
-                self.db.update_position_opened(row_id, t, res.get("price", 0.0))
+                self.db.update_position_opened(row_id, t,
+                                               res.get("price") or price)
                 opened.append(t)
                 trades_log.info(
                     f"OPEN_BARE signal={signal_id} channel={channel.name} "
-                    f"{direction.upper()} {symbol} lot={self.min_lot} ticket={t}"
+                    f"{direction.upper()} {symbol} lot={self.min_lot} "
+                    f"sl={sl} ticket={t}"
                 )
 
         self.db.update_signal_status(signal_id, "open" if opened else "failed")
+        every = int(os.getenv("BARE_PARTIAL_MINUTES", "39"))
+        arm_r = float(os.getenv("RUNNER_TRAIL_ARM_R", "1.0"))
+        one_r = (price + arm_r * sl_pips * pip) if direction == "buy" \
+            else (price - arm_r * sl_pips * pip)
         await self._notify(
             f"{emoji} <b>Pre-signal opened</b> — {channel.name}\n"
-            f"<b>{direction.upper()} {symbol}</b>  ×{len(opened)}\n"
+            f"<b>{direction.upper()} {symbol}</b>  ×{len(opened)} "
+            f"at <code>{price:g}</code>\n"
+            f"Protective SL <code>{sl:g}</code> ({sl_pips:g} pips)\n"
             f"Tickets: {', '.join(f'<code>{t}</code>' for t in opened)}\n"
-            f"⏳ Auto-closes in 15 min if no full signal arrives\n"
+            f"📈 No fixed target. At <code>{round(one_r, 2):g}</code> "
+            f"({arm_r:g}R) the EA takes over the stop and trails it.\n"
+            f"⏳ Upgrades when the levels arrive; otherwise scales out every "
+            f"{every} min\n"
             f"Signal: <code>{signal_id}</code>"
         )
 
@@ -711,18 +879,81 @@ class SignalExecutor:
     # ── Breakeven ──────────────────────────────────────────────────────────────
 
     async def _handle_breakeven(self, signal, channel):
-        modified = 0
+        """Move the stop to entry when the operator says to go risk free.
+
+        Two guards, both added after Lion Trading on 2026-08-25. The operator
+        posted "GOLD sell now" and the full signal 87 seconds later; our fill
+        was 4635.028, roughly five pips worse than his. At 08:16 he said "you
+        can go risk free". His stop sat at his entry, ours at ours, five pips
+        lower — and price retraced through ours and not his. He was fine and we
+        took the stop on a trade that was working.
+
+        The structural fix is entering on the bare call, which is now done.
+        These two are the belt:
+
+          slack_pips        put the stop that far on the LOSING side of entry
+                            rather than exactly at it. An exact-entry stop is
+                            already a small loss once the spread is paid, and
+                            it sits precisely where noise lives.
+          min_profit_pips   refuse to move the stop at all until price is that
+                            far in profit. Below it, "breakeven" means placing
+                            a stop on top of the market, which is not risk-free,
+                            it is an instant exit.
+
+        Both default to 0, so a channel that sets neither behaves exactly as
+        before.
+        """
+        be = channel.breakeven or {}
+        p = channel.parser or {}
+        pip = float(p.get("pip_value", 0.1))
+        slack = float(be.get("slack_pips", 0) or 0) * pip
+        min_profit = float(be.get("min_profit_pips", 0) or 0) * pip
+
+        modified, deferred, skipped = 0, 0, 0
         for sig_row in self.db.get_open_signals(channel.id, signal.symbol):
+            direction = str(sig_row["direction"] or "").lower()
             for pos in self.db.get_open_positions(sig_row["signal_id"]):
-                if pos["ticket"] and pos["entry_price"]:
-                    if await self.bridge.modify_position(
-                            pos["ticket"], float(pos["entry_price"]),
-                            float(pos["tp_price"] or 0)):
-                        modified += 1
-        msg = (f"⚖️ <b>Breakeven</b> — {channel.name}\n{modified} position(s) updated."
-               if modified else
-               f"⚠️ Breakeven: no open positions for {channel.name}")
-        await self._notify(msg)
+                if not (pos["ticket"] and pos["entry_price"]):
+                    skipped += 1
+                    continue
+                entry = float(pos["entry_price"])
+                want = entry
+                if slack and direction in ("buy", "sell"):
+                    want = entry - slack if direction == "buy" else entry + slack
+                if min_profit and direction in ("buy", "sell"):
+                    live = await self.bridge.get_price(
+                        signal.symbol or channel.symbol, direction)
+                    if live:
+                        moved = (float(live) - entry) if direction == "buy" \
+                            else (entry - float(live))
+                        if moved < min_profit:
+                            deferred += 1
+                            logger.info(
+                                "[EXECUTOR] %s: breakeven deferred on ticket %s "
+                                "— only %.1f pips in profit, needs %.0f",
+                                channel.name, pos["ticket"], moved / pip,
+                                min_profit / pip)
+                            continue
+                if await self.bridge.modify_position(
+                        pos["ticket"], round(want, 3),
+                        float(pos["tp_price"] or 0)):
+                    modified += 1
+
+        if not modified and not deferred:
+            await self._notify(
+                f"⚠️ Breakeven: no open positions for {channel.name}")
+            return
+        note = ""
+        if slack:
+            note += f"\nStop set {slack / pip:.0f} pips beyond entry so noise " \
+                    f"does not take it."
+        if deferred:
+            note += f"\n<b>{deferred}</b> left alone — not yet " \
+                    f"{min_profit / pip:.0f} pips in profit, so a stop at entry " \
+                    f"would sit on the market."
+        await self._notify(
+            f"⚖️ <b>Breakeven</b> — {channel.name}\n"
+            f"{modified} position(s) updated.{note}")
 
     # ── TP hit ─────────────────────────────────────────────────────────────────
 

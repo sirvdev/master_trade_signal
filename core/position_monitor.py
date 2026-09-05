@@ -45,6 +45,11 @@ RUNNER_TRAIL_DISTANCE  = float(os.getenv("RUNNER_TRAIL_DISTANCE", "0"))
 # Minimum improvement before sending another modify. Stops the 5s loop from
 # spamming the terminal with sub-tick adjustments.
 RUNNER_TRAIL_STEP      = float(os.getenv("RUNNER_TRAIL_STEP", "0.50"))
+# How far a LADDERLESS runner (a bare "gold buy now", which has a stop and no
+# target) must travel in its own favour before the trailing engine takes over,
+# measured in R - multiples of its own stop distance. 1.0 = one R.
+# A ladder runner ignores this and waits for its siblings to close instead.
+RUNNER_TRAIL_ARM_R     = float(os.getenv("RUNNER_TRAIL_ARM_R", "1.0"))
 
 
 class PositionMonitor:
@@ -61,6 +66,11 @@ class PositionMonitor:
         # set_trailing, so an older build degrades to Python trailing instead
         # of retrying a command it will never understand.
         self._ea_trailing = True
+        # Same idea for the ORDERS pool query. Cleared after two consecutive
+        # failures so a terminal that never answers it is asked once, not on
+        # every 5-second cycle for the rest of the session.
+        self._ea_orders = True
+        self._orders_fails = 0
 
     async def start(self):
         self._running = True
@@ -84,6 +94,20 @@ class PositionMonitor:
 
         live_tickets = {int(p["ticket"]): p for p in live if p.get("ticket")}
 
+        # A PENDING order is not a position. MT5 keeps unfilled limit and stop
+        # orders in the orders pool, and get_all_positions() does not return
+        # them. Without this second query every limit order we placed vanished
+        # from live_tickets on the very next tick and was written off as
+        # "closed externally pnl=0.00" one second after it was placed.
+        #
+        # 2026-08-24 is the whole story: nine of the day's fifteen signals were
+        # limit orders, every one of them was marked closed within 1-3 seconds
+        # with pnl 0, and the orders themselves were left sitting in the
+        # terminal with nothing tracking them. It also produced the duplicate
+        # the operator noticed: with the first order forgotten, a repost of the
+        # same setup 49 minutes later looked new and placed a second one.
+        pending_tickets = await self._pending_tickets()
+
         # Get all positions we think are open
         db_open = self.db.get_all_open_positions()
 
@@ -102,9 +126,22 @@ class PositionMonitor:
                 mfe = max(float(pos["mfe"] or 0.0), max(0.0, profit))
                 mae = min(float(pos["mae"] or 0.0), min(0.0, profit))
                 self.db.update_position_pnl(ticket, profit, mfe, mae)
-            else:
-                # Not found on MT5 — was closed externally
+                continue
+
+            # Gone from the positions pool. Pending, or genuinely closed?
+            if pending_tickets is not None:
+                if int(ticket) in pending_tickets:
+                    continue            # waiting for price to come to it
                 await self._handle_close(pos)
+                continue
+
+            # No orders pool to consult. Ask about THIS ticket instead of
+            # giving up on the whole cycle: a position that filled and closed
+            # has closing deals, an order that never filled has none. One
+            # round trip, and only for a ticket that has actually vanished.
+            deal = await self._closing_deals(int(ticket))
+            if deal is not None:
+                await self._handle_close(pos, deal=deal)
 
         # Trail any runner whose sibling take-profit legs are done
         if RUNNER_TRAIL_ENABLED:
@@ -113,6 +150,58 @@ class PositionMonitor:
         # Zone-ladder housekeeping and per-channel breakeven policy
         await self._manage_ladders(db_open, live_tickets)
         await self._auto_breakeven(db_open, live_tickets)
+
+    async def _pending_tickets(self):
+        """Tickets sitting unfilled in MT5's ORDERS pool, or None if unknowable.
+
+        Stops asking after two consecutive failures. On 2026-08-25 the EA on
+        the chart never answered get_all_orders and the call timed out after a
+        full 30 seconds, 777 times in one session: about six and a half hours
+        of wall clock, and it stretched the 5-second monitor cycle to ~36
+        seconds, which delays every stop move and close detection behind it.
+        A capability the terminal does not have must be asked about once, not
+        once per cycle forever.
+        """
+        if not self._ea_orders:
+            return None
+        try:
+            pending = await self.bridge.get_all_orders()
+        except Exception as e:
+            logger.debug("[MONITOR] get_all_orders raised: %s", e)
+            pending = None
+        if pending is None:
+            self._orders_fails += 1
+            if self._orders_fails >= 2:
+                self._ea_orders = False
+                logger.error(
+                    "[MONITOR] get_all_orders has failed %d times — the EA on "
+                    "the chart does not answer it. Falling back to a per-ticket "
+                    "deal-history check, which is correct but slower per closed "
+                    "position. RECOMPILE PythonFileBridge.mq5 (v2.400+ "
+                    "implements get_all_orders) and restart to restore the "
+                    "bulk query.", self._orders_fails)
+            return None
+        self._orders_fails = 0
+        return {int(o["ticket"]) for o in pending if o.get("ticket")}
+
+    async def _closing_deals(self, ticket: int):
+        """The deal history for `ticket`, or None if it has not closed.
+
+        The EA answers "No closing deals found" as an error, and the bridge
+        turns that into None, so None means one of two things: the order never
+        filled, or the history is not written yet. Both say "do not close it",
+        and the next cycle asks again. Erring this way leaves a closed position
+        marked open for a few seconds; erring the other way writes an
+        irreversible close into the ledger for an order that is still live.
+        """
+        try:
+            deal = await self.bridge.get_deal_history(ticket)
+        except Exception as e:
+            logger.debug("[MONITOR] get_deal_history(%s) raised: %s", ticket, e)
+            return None
+        if not deal or deal.get("status") != "success":
+            return None
+        return deal
 
     # ── Zone ladder: cancel the legs that price left behind ───────────────────
 
@@ -158,10 +247,12 @@ class PositionMonitor:
                 if moved < trigger:
                     continue
 
-                pending = await self.bridge.get_all_orders()
-                if pending is None:
+                # Same query, same off-switch. Calling the bridge directly here
+                # meant this path kept paying the 30-second timeout even after
+                # _cycle had given up on it.
+                pend = await self._pending_tickets()
+                if pend is None:
                     continue
-                pend = {int(o["ticket"]) for o in pending if o.get("ticket")}
                 cancelled = 0
                 for p in legs:
                     t = p["ticket"]
@@ -220,17 +311,36 @@ class PositionMonitor:
                     continue
                 pip_value = float((ch.parser or {}).get("pip_value", 0.1))
                 buffer_px = float(be.get("buffer_pips", 0) or 0) * pip_value
+                # Same cushion the operator-message path uses. Without it the
+                # two routes to breakeven put the stop in different places on
+                # the same channel, which is impossible to reason about.
+                slack_px = float(be.get("slack_pips", 0) or 0) * pip_value
                 direction = str(sig["direction"]).lower()
 
                 armed = False
                 why = ""
                 if tp_idx > 0:
-                    done = [p for p in self.db.get_positions_by_signal(signal_id)
-                            if p["status"] == "closed"
-                            and str(p["close_reason"]).lower() == "tp"
-                            and (p["tp_index"] or 99) <= tp_idx]
-                    if done:
-                        armed, why = True, f"TP{tp_idx} reached"
+                    tps_done = [p for p in self.db.get_positions_by_signal(signal_id)
+                                if p["status"] == "closed"
+                                and str(p["close_reason"]).lower() == "tp"]
+                    # "Breakeven after TP2" means TP2 is BANKED. The old test
+                    # was `any leg with index <= 2 closed at tp`, which armed
+                    # after TP1 and then logged "TP2 reached", so the setting
+                    # did the wrong thing and said the wrong thing about it.
+                    #
+                    # Two ways to be satisfied, because a ladder can be trimmed
+                    # before it opens: _tp_passed skips a target the market has
+                    # already gone through, and the min_lot floor drops the far
+                    # legs. Either the leg numbered tp_idx closed at target, or
+                    # tp_idx legs have closed at target between them.
+                    hit_that_leg = any((p["tp_index"] or 0) == tp_idx
+                                       for p in tps_done)
+                    if hit_that_leg:
+                        armed, why = True, f"TP{tp_idx} closed at target"
+                    elif len(tps_done) >= tp_idx:
+                        armed, why = True, (f"{len(tps_done)} take profit(s) "
+                                            f"banked (ladder was trimmed, so "
+                                            f"leg {tp_idx} never opened)")
 
                 for p in legs:
                     t = p["ticket"]
@@ -254,8 +364,13 @@ class PositionMonitor:
                     if not leg_armed:
                         continue
 
-                    want = round(entry + buffer_px, 3) if direction == "buy" \
-                        else round(entry - buffer_px, 3)
+                    # buffer_px moves the stop INTO profit (aggressive);
+                    # slack_px moves it the other way, leaving room for the
+                    # noise that otherwise takes an exactly-at-entry stop.
+                    # They are opposite by design and both may be set.
+                    off = buffer_px - slack_px
+                    want = round(entry + off, 3) if direction == "buy" \
+                        else round(entry - off, 3)
                     # Only ever improve, and never put the stop through the market.
                     if direction == "buy":
                         if live_sl >= want - 1e-9 or want >= cur:
@@ -299,16 +414,6 @@ class PositionMonitor:
             return
         direction = str(sig["direction"]).lower()
 
-        # Has the rest of the ladder been reached yet?
-        siblings = [p for p in self.db.get_positions_by_signal(pos["signal_id"])
-                    if float(p["tp_price"] or 0.0) != 0.0]
-        if not siblings:
-            return                                # no ladder: nothing to wait for
-        done = [p for p in siblings if p["status"] == "closed"]
-        needed = RUNNER_TRAIL_AFTER_TPS or len(siblings)
-        if len(done) < needed:
-            return
-
         cur = float(mt5.get("current_price") or 0.0)
         if cur <= 0:
             return
@@ -320,6 +425,29 @@ class PositionMonitor:
             dist = abs(entry - orig_sl) if (entry and orig_sl) else 0.0
         if dist <= 0:
             return
+
+        # Has the rest of the ladder been reached yet?
+        siblings = [p for p in self.db.get_positions_by_signal(pos["signal_id"])
+                    if float(p["tp_price"] or 0.0) != 0.0]
+        if siblings:
+            done = [p for p in siblings if p["status"] == "closed"]
+            needed = RUNNER_TRAIL_AFTER_TPS or len(siblings)
+            if len(done) < needed:
+                return
+        else:
+            # NO LADDER. A bare "gold sell now" opens one leg with a protective
+            # stop and no target at all, so there is nothing to wait for and
+            # this used to return here - meaning a bare trade was never trailed
+            # and never managed by anything except the timed scale-out.
+            #
+            # Arm on distance instead: once the trade is RUNNER_TRAIL_ARM_R
+            # times its own stop distance in profit (1.0 = one R), hand it to
+            # the EA's trailing engine. That is strictly better than parking a
+            # fixed take profit at 1R, which would cap every bare trade at
+            # exactly 1R and close the ones that were about to run.
+            moved = (cur - entry) if direction == "buy" else (entry - cur)
+            if moved < RUNNER_TRAIL_ARM_R * dist:
+                return
 
         ticket = int(pos["ticket"])
 
@@ -383,13 +511,17 @@ class PositionMonitor:
                            "(needs v2.504+) — falling back to Python trailing")
         return False
 
-    async def _handle_close(self, pos):
+    async def _handle_close(self, pos, deal=None):
         ticket    = pos["ticket"]
         signal_id = pos["signal_id"]
         channel_id = pos["channel_id"]
 
-        # Fetch deal history for P&L
-        deal = await self.bridge.get_deal_history(ticket)
+        # Fetch deal history for P&L. The caller may already have it: the
+        # fallback path in _cycle fetches it to decide whether the position
+        # closed at all, and re-asking would double the round trips on the
+        # very path taken when the bridge is already struggling.
+        if deal is None:
+            deal = await self.bridge.get_deal_history(ticket)
         pnl  = 0.0
         reason = "closed"
 
@@ -457,56 +589,175 @@ class PositionMonitor:
                 logger.debug(f"[MONITOR] Notify error: {e}")
 
     async def _update_drawdowns(self):
+        """Per-channel drawdown, measured against each channel's own book.
+
+        THE BUG THIS REPLACES (live from the first commit to 2026-08-30):
+
+            dd = (start_eq - equity) / start_eq * 100
+
+        `start_eq` was the channel's notional book, $1000. `equity` was the
+        WHOLE ACCOUNT's live equity. With a $9,794 account that evaluates to
+        (1000 - 9794)/1000 = -879% for every channel on every cycle. It is
+        negative and stays negative, so `dd >= ch.drawdown_pct` was never true
+        and not one halt fired in the system's entire log history. Worse, the
+        expression flips sign if account equity ever drops below the notional:
+        below $700 EVERY channel halts at once, profitable ones included,
+        because they all read the same account number.
+
+        The replacement compares like with like: a channel's own realised and
+        floating P&L today, against its own book at the start of the day.
+
+            dd = -(realised_today + floating_now) / day_start_book * 100
+
+        Nothing here reads account equity, so 28 channels sharing one MT5
+        account no longer contaminate each other's numbers.
+
+        The account-level guard is separate and deliberately so. Per-channel
+        limits cannot bound total exposure: 28 channels each allowed a 30% loss
+        on a $1000 book is $8,400 of permitted loss on a $9,794 account. The
+        account guard is the only thing that caps the sum.
+        """
+        # No config means no per-channel drawdown to track. Returning here
+        # rather than raising matters because this runs inside _cycle: an
+        # AttributeError thrown from the drawdown pass aborts the whole cycle,
+        # so nothing gets its P&L updated and nothing gets closed either.
+        if not self.config or not getattr(self.config, "channels", None):
+            return
         equity = await self.bridge.get_equity()
         if not equity:
             return
 
         today = datetime.utcnow().date().isoformat()
 
+        # A halt is a decision about TODAY. Roll it off at the date change, or
+        # a channel stopped on Monday stays stopped all week and silently stops
+        # being measured. Previously `halted` only cleared on a process restart.
+        if getattr(self, "_halt_day", None) != today:
+            for ch in self.config.channels:
+                if getattr(ch, "halted", False):
+                    logger.info("[MONITOR] New UTC day — un-halting %s",
+                                getattr(ch, "name", ch))
+                try:
+                    ch.halted = False
+                except Exception:
+                    pass
+            self._halt_day = today
+            self._account_halted = False
+
+        day_total = 0.0
+
         for ch in self.config.channels:
             if not ch.enabled:
                 continue
 
+            # The channel's book at the start of the day. channel_stats keeps
+            # it once set, so intraday P&L cannot move the denominator.
             today_stats = self.db.get_today_stats(ch.id)
-
             if today_stats and today_stats["date"] == today and \
                today_stats["starting_equity"]:
-                # Use today's recorded starting equity
-                start_eq = float(today_stats["starting_equity"])
+                start_book = float(today_stats["starting_equity"])
             else:
-                # First record of the day OR new day — initialise
-                # If we have a system_balance, prefer that (more reliable than
-                # raw equity which may include floating P&L).
                 sys_rec = self.db.get_system_balance(ch.id)
-                if sys_rec and ch.starting_balance > 0:
-                    start_eq = float(sys_rec["system_balance"])
+                if sys_rec:
+                    start_book = float(sys_rec["system_balance"])
+                elif ch.starting_balance > 0:
+                    start_book = float(ch.starting_balance)
                 else:
-                    start_eq = float(equity)
+                    # starting_balance 0 means "size off live equity", so the
+                    # account IS this channel's book and equity is the right
+                    # denominator. That is the one case the old code got right.
+                    start_book = float(equity)
                 logger.info(
-                    f"[MONITOR] Initialising starting_equity for {ch.name} "
-                    f"on {today}: ${start_eq:.2f}"
+                    f"[MONITOR] Day-start book for {ch.name} on {today}: "
+                    f"${start_book:.2f}"
                 )
 
-            self.db.upsert_channel_equity(ch.id, equity, start_eq)
+            realised, floating = self.db.get_channel_day_pnl(ch.id, today)
+            day_pnl = realised + floating
+            day_total += day_pnl
 
-            # Calculate drawdown
-            if start_eq > 0:
-                dd = (start_eq - equity) / start_eq * 100
-                ch.current_drawdown = dd
+            # Record the channel's own book, not account equity, so the
+            # dashboard and the daily report stop showing 28 identical numbers.
+            self.db.upsert_channel_equity(ch.id, start_book + day_pnl, start_book)
 
-                if dd >= ch.drawdown_pct and not ch.halted:
-                    ch.halted = True
-                    logger.warning(
-                        f"[MONITOR] Channel {ch.name} HALTED — "
-                        f"drawdown {dd:.1f}% >= limit {ch.drawdown_pct}%"
-                    )
-                    if self.notifier:
-                        try:
-                            await self.notifier.send(
-                                f"🚨 <b>Channel Halted: {ch.name}</b>\n"
-                                f"Drawdown: <code>{dd:.1f}%</code> "
-                                f"(limit: {ch.drawdown_pct}%)\n"
-                                f"No new signals will be executed today."
-                            )
-                        except Exception:
-                            pass
+            if start_book <= 0:
+                continue
+
+            dd = max(0.0, -day_pnl / start_book * 100.0)
+            ch.current_drawdown = dd
+
+            if dd >= ch.drawdown_pct and not ch.halted:
+                ch.halted = True
+                logger.warning(
+                    f"[MONITOR] Channel {ch.name} HALTED — drawdown {dd:.1f}% "
+                    f">= limit {ch.drawdown_pct}% "
+                    f"(realised {realised:+.2f}, floating {floating:+.2f}, "
+                    f"book ${start_book:.2f})"
+                )
+                if self.notifier:
+                    try:
+                        await self.notifier.send(
+                            f"🚨 <b>Channel Halted: {ch.name}</b>\n"
+                            f"Drawdown: <code>{dd:.1f}%</code> "
+                            f"(limit: {ch.drawdown_pct}%)\n"
+                            f"Realised <code>{realised:+.2f}</code>  "
+                            f"Floating <code>{floating:+.2f}</code>  "
+                            f"on a <code>${start_book:.2f}</code> book\n"
+                            f"No new signals from this channel until "
+                            f"{today} rolls over."
+                        )
+                    except Exception:
+                        pass
+
+        await self._check_account_guard(day_total, float(equity))
+
+    async def _check_account_guard(self, day_total: float, equity: float):
+        """Account-level kill switch. Halts EVERY channel, not just one.
+
+        Per-channel limits bound each channel in isolation and therefore bound
+        nothing in aggregate. This is the only ceiling on the account itself.
+
+        ACCOUNT_MAX_DAILY_LOSS_PCT is read from the environment so it can be
+        changed without a code edit. 0 disables the guard, which restores the
+        old (unbounded) behaviour for anyone who wants it.
+        """
+        try:
+            limit_pct = float(os.getenv("ACCOUNT_MAX_DAILY_LOSS_PCT", "10"))
+        except ValueError:
+            limit_pct = 10.0
+        if limit_pct <= 0 or getattr(self, "_account_halted", False):
+            return
+
+        # Denominator is the account as it stood before today's damage, so the
+        # percentage does not shrink as the account does.
+        base = equity - day_total
+        if base <= 0:
+            return
+        loss_pct = max(0.0, -day_total / base * 100.0)
+        if loss_pct < limit_pct:
+            return
+
+        self._account_halted = True
+        halted_now = [c for c in self.config.channels if c.enabled and not c.halted]
+        for ch in halted_now:
+            ch.halted = True
+        logger.critical(
+            "[MONITOR] ACCOUNT GUARD TRIPPED — day P&L %+.2f = %.1f%% of "
+            "$%.2f, limit %.1f%%. Halting all %d enabled channels.",
+            day_total, loss_pct, base, limit_pct,
+            sum(1 for c in self.config.channels if c.enabled))
+        if self.notifier:
+            try:
+                await self.notifier.send(
+                    f"🛑 <b>ACCOUNT GUARD TRIPPED</b>\n"
+                    f"Day P&L: <code>{day_total:+.2f}</code> "
+                    f"= <code>{loss_pct:.1f}%</code> of "
+                    f"<code>${base:.2f}</code>\n"
+                    f"Limit: <code>{limit_pct:.1f}%</code> "
+                    f"(ACCOUNT_MAX_DAILY_LOSS_PCT)\n"
+                    f"<b>All channels halted for the rest of the UTC day.</b>\n"
+                    f"Open positions are NOT closed — this stops new entries "
+                    f"only. Close them yourself if you want out."
+                )
+            except Exception:
+                pass

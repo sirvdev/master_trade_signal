@@ -11,6 +11,8 @@ import logging
 import os
 import signal
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from config import load_config
@@ -20,21 +22,89 @@ from core.signal_executor import SignalExecutor
 from core.position_monitor import PositionMonitor
 from core.bare_trade_watcher import BareTradeWatcher
 from channels.channel_manager import ChannelManager
+from core import daily_report
+from core.daily_report import DailyReport
 from db.database import Database
 from notifications.notifier import Notifier
+
+
+class _Tee:
+    """Duplicate a stream to a file without swallowing it."""
+
+    def __init__(self, stream, fh):
+        self._stream, self._fh = stream, fh
+
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        try:
+            self._fh.write(data)
+            self._fh.flush()
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self):
+        for t in (self._stream, self._fh):
+            try:
+                t.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+
+def _tee_stdio(path: str):
+    """Send stdout and stderr to the terminal AND to terminal.log."""
+    try:
+        fh = open(path, "a", encoding="utf-8", errors="replace")
+        fh.write("\n" + "=" * 70 + "\n[terminal capture started "
+                 + datetime.utcnow().isoformat() + "Z]\n" + "=" * 70 + "\n")
+        fh.flush()
+        sys.stdout = _Tee(sys.stdout, fh)
+        sys.stderr = _Tee(sys.stderr, fh)
+    except Exception as e:
+        print("[MAIN] terminal capture unavailable: " + str(e))
 
 
 def _setup_logging(log_dir: str):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     Path(f"{log_dir}/channels").mkdir(exist_ok=True)
 
+    # UTC, and say so on every line.
+    #
+    # logging defaults to the machine's local time. This box runs at UTC-7
+    # while Telegram message timestamps, the signals/positions tables and the
+    # daily-report schedule are all UTC, so every log line read seven hours
+    # earlier than the same event in Telegram. Reading a signal that the
+    # channel posted at 13:24 next to a log line stamped 06:25 is how you end
+    # up believing signals were missed when they were processed on time. One
+    # clock for the whole system, and it is UTC.
+    #
+    # LOG_LOCAL_TIME=true restores the old behaviour if you prefer wall clock.
     fmt = logging.Formatter(
         "%(asctime)s [%(name)s] %(levelname)s — %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S" +
+                ("" if os.getenv("LOG_LOCAL_TIME", "").lower() == "true" else "Z"),
     )
+    if os.getenv("LOG_LOCAL_TIME", "").lower() != "true":
+        fmt.converter = time.gmtime
     handlers = [
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(f"{log_dir}/system.log", encoding="utf-8"),
+        # Everything logged also lands here, alongside anything printed outside
+        # the logging module (see _tee_stdio). system.log only ever contained
+        # records that went through logging: a bare traceback or a library
+        # writing to stderr went to the terminal and nowhere else, so it was
+        # gone as soon as the window scrolled. terminal.log is the one to read
+        # when something died.
+        logging.FileHandler(f"{log_dir}/terminal.log", encoding="utf-8"),
     ]
     for h in handlers:
         h.setFormatter(fmt)
@@ -43,6 +113,8 @@ def _setup_logging(log_dir: str):
     root.setLevel(logging.INFO)
     for h in handlers:
         root.addHandler(h)
+
+    _tee_stdio(f"{log_dir}/terminal.log")
 
     # Suppress noisy third-party loggers
     logging.getLogger("telethon").setLevel(logging.WARNING)
@@ -140,7 +212,13 @@ async def main():
     await notifier.notify_startup(active_provider, enabled_channels)
     await notifier.notify_alive(15)
 
-    heartbeat_interval = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "15000"))
+    # Daily channel scorecard, fired between the NY close and the Tokyo open.
+    report = DailyReport(db, cfg, notifier)
+    report_task = None
+    if daily_report.REPORT_ENABLED:
+        report_task = asyncio.create_task(report.start())
+
+    heartbeat_interval = int(os.getenv("TELEGRAM_HEARTBEAT_MINUTES", "15"))
     heartbeat_task = None
     if heartbeat_interval > 0:
         heartbeat_task = asyncio.create_task(_heartbeat_loop(notifier, heartbeat_interval))
@@ -179,6 +257,9 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt")
     finally:
+        if report_task is not None:
+            report.stop()
+            report_task.cancel()
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -41,6 +41,7 @@ class Intent(str, Enum):
     MOVE_SL_BE     = "MOVE_SL_BE"       # move stop to entry (+ buffer)
     MOVE_SL_PRICE  = "MOVE_SL_PRICE"    # move stop to an explicit price
     MODIFY_TP      = "MODIFY_TP"        # replace TP ladder
+    PRE_SIGNAL     = "PRE_SIGNAL"       # "Gold buy now" -> get in before the levels
     STATUS_REPORT  = "STATUS_REPORT"    # "TP2 hit, 130 pips" -> log only, no action
     CHATTER        = "CHATTER"          # greetings, promos, member talk -> ignore
     UNKNOWN        = "UNKNOWN"          # deterministic layer abstained
@@ -67,6 +68,8 @@ class Signal:
     has_open_runner: bool = False         # a "TP: open" leg with no fixed target
     is_zone: bool = False
     needs_market_entry: bool = False   # MARKET order: entry unknown until fill
+    # The message named an instrument other than the one this channel trades.
+    foreign_symbol: Optional[str] = None
     raw_text: str = ""
     def as_dict(self) -> dict:
         return {
@@ -121,6 +124,21 @@ class ParsedMessage:
 # Telegram "styled" alphabets (mathematical bold, etc.) collapse to ASCII under
 # NFKC. Without this, "GOLD Sell" never matches /gold/i.
 _MD_NOISE = re.compile(r"(\*\*|__|~~|\|\|)")
+# Markdown that opens or closes inside a number: "437**1" -> "4371".
+# Requires a digit on both sides, so it can never join two real values.
+#
+# ASTERISKS AND TILDES ONLY. "__" is NOT in this class and must never be,
+# because two channels use it as a ZONE SEPARATOR, not as markdown:
+#   John Wick FX  "GOLD BUY NOW 4816__4814"  = the zone 4814-4816
+#   Emily Pips    "Price Open @ 4097_4000"
+# Joining those produces 48164814, which is outside price_max, so the entry
+# vanishes. Adding "__" here cost 100 John Wick signals and 13 Mr Zack
+# signals their entry price when it was tried on 2026-08-30. The same two
+# characters mean opposite things on different channels and no global rule
+# can serve both; the one "Sl 46__75" in the corpus stays unread on purpose.
+_MD_SPLIT_NUM = re.compile(r"(?<=\d)(?:\*\*|~~)(?=\d)")
+# "4816__4814" / "4097_4000" -> a canonical zone separator. See normalize().
+_ZONE_UNDERSCORE = re.compile(r"(?<=\d)_+(?=\d)")
 _ZERO_WIDTH = re.compile(r"[​-‏⁠﻿͏︀-️]")
 _DASHES = dict.fromkeys(map(ord, "‐‑‒–—―−"), "-")
 _QUOTES = {0x2018: "'", 0x2019: "'", 0x201c: '"', 0x201d: '"', 0x00a0: " "}
@@ -138,9 +156,32 @@ def normalize(text: Optional[str]) -> str:
     t = unicodedata.normalize("NFKC", text)
     t = t.translate(_DASHES).translate(_QUOTES)
     t = _ZERO_WIDTH.sub("", t)
+    # A bold run that OPENS OR CLOSES INSIDE A NUMBER. Telegram lets an
+    # operator bold part of a price, and the export preserves it literally:
+    #   "SL 437**1"   "Sl :4**009"   "Sl 46__75"   "STOP Loss 42**10"
+    # _MD_NOISE below turns the marker into a space, which is right between
+    # words and fatal between digits - 4009 became "4 009" and the stop was
+    # then unreadable, so the whole signal was refused for having no stop.
+    # Deleting rather than spacing is only safe when a digit sits on BOTH
+    # sides, which is why this runs first and separately. 15 messages in the
+    # 21,738-message corpus; every one of them a stop or a target.
+    t = _MD_SPLIT_NUM.sub("", t)
+    # A digit-flanked underscore run is a ZONE SEPARATOR, not markdown:
+    #   John Wick FX  "GOLD BUY NOW 4816__4814"  = the zone 4814-4816
+    #   Emily Pips    "Price Open @ 4097_4000"
+    # _MD_NOISE below turns "__" into a space, which erases the pairing and
+    # left both channels reading a single entry at one edge. Canonicalising
+    # to "-" first hands the pair to the zone rule intact, and _MD_NOISE
+    # never sees it. Deleting the underscore instead would join the two
+    # prices into 48164814 - the regression of 2026-08-30.
+    t = _ZONE_UNDERSCORE.sub("-", t)
     t = _MD_NOISE.sub(" ", t)
     for pat, rep in _HOMOGLYPH_WORDS.items():
         t = re.sub(pat, rep, t, flags=re.I)
+    # An underscore is a WORD character, so "GOLD_BUY NOW 4610/4608" never
+    # matched \bbuy\b and the whole channel parsed as chatter: 1432 messages,
+    # zero signals. Split underscores that sit between letters.
+    t = re.sub(r"(?<=[A-Za-z])_(?=[A-Za-z])", " ", t)
     # Drop emoji / pictographs but keep the space so tokens stay separated.
     t = "".join(" " if unicodedata.category(c) == "So" else c for c in t)
     t = re.sub(r"[ \t]+", " ", t)
@@ -152,11 +193,19 @@ _BUY  = r"(?:buy|long|bull(?:ish)?)"
 _SELL = r"(?:sell|short|bear(?:ish)?)"
 RE_BUY   = re.compile(rf"\b{_BUY}\b", re.I)
 RE_SELL  = re.compile(rf"\b{_SELL}\b", re.I)
+# Arrow separators. Green Pips Zone (-1002145295870) writes every ticket as
+# "Entry → 4322 ... SL → 4332". Without the arrow in the separator class the
+# stop is unreadable, requires_sl refuses the signal, and 116 of that channel's
+# 261 signals — 44% — never trade. The arrow only ever appears between a label
+# and its price, so widening the class cannot capture anything else. Both the
+# real arrow (U+2192) and the emoji arrow (U+27A1, usually followed by a
+# variation selector) are in use; ">" is included for the ASCII spelling.
+_ARROW = "→➡️>"
 RE_SL = re.compile(
     r"(?:stop\s*-?\s*loss|\bstoploss\b|\bs\s*[./]\s*l\b|\bsl\b|\bstop\b)"
     r"\s*(?:\(\s*(?:sl|s/l)\s*\))?"
     r"\s*(?:place[d]?\s*(?:at)?)?"
-    r"[\s:.\-=@()/_]*"
+    rf"[\s:.\-=@()/_{_ARROW}]*"
     r"(\d{3,5}(?:\.\d{1,3})?)"
     r"(?!\s*\+?\s*(?:pips?|points?|%))", re.I)
 # "TP1: 4416", "TP 2:4412", "TP 3.4408", "TP. 4415", "@TP: 4302",
@@ -176,14 +225,16 @@ RE_TP = re.compile(
     r"(?:\btp|\bt\s*/\s*p|take\s*profit|\btarget)"
     r"\s*(?:\(\s*\d{1,2}\s*\)|\d{1,2}(?!\d))?"
     r"\s*(?:@|\bat\b)?"
-    r"[\s:.\-=@)]*"
+    rf"[\s:.\-=@(){_ARROW}]*"
     r"(\d{3,5}(?:\.\d{1,3})?|open)"
     r"(?!\s*\+?\s*(?:pips?|points?|%))", re.I)
 RE_TP_EVERY = re.compile(
     r"\btp\b[^\n]{0,20}\bevery\b\s*(\d{2,4})\s*pips?", re.I)
+# A line that is nothing but a "Targets:" header. See _targets_block.
+_RE_TARGETS_HDR = re.compile(r"^\W*(?:targets?|tps?)\W*$", re.I)
 RE_ENTRY_LABEL = re.compile(
     r"(?:\bentry\b|\bentries\b|\benter\b|open\s+new\s+positions?\s+at|\bzone\b|\bat\b|@)"
-    r"\s*(?:zone)?\s*[:.\-=]?\s*", re.I)
+    rf"\s*(?:zone)?\s*[:.\-={_ARROW}]?\s*", re.I)
 RE_LIMIT   = re.compile(r"\b(limit|pending)\b", re.I)
 RE_STOPORD = re.compile(r"\bbuy\s+stop\b|\bsell\s+stop\b|\bstop\s+order\b", re.I)
 # The word "stop" is overloaded. In "Gold buy stop 4420-4425" it names the ORDER
@@ -211,6 +262,42 @@ def _sl_matches(t: str):
         good.append(m)
     return skipped, good
 RE_MARKET  = re.compile(r"\b(now|market\s*(?:execution|order)?|instant)\b", re.I)
+
+# ── Bare directional calls ("pre-signals") ────────────────────────────────────
+# Several operators post the direction first and the levels a minute or two
+# later: GTMO's "Gold buy now" (2026-08-25 09:32:22Z) was followed by a 100-pip
+# move before any stop or target existed, and Lion Trading's "Sell gold"
+# (07:36:16Z) came 87 seconds before the full signal. By the time the levels
+# arrive the price has left, so the trade either fills worse than the operator's
+# or is refused for slippage outright. Taking the bare call is the only way to
+# be in at the operator's price.
+#
+# The detection has to be strict, because a false positive opens a real
+# position with no levels. The rule is: after stripping punctuation, EVERY word
+# must be a direction, the instrument, or a known filler. Anything else — a
+# number, a name, a verb that is not on the list — disqualifies it. That is
+# what separates "Gold buy now" from "when you say buy 1 minutes next
+# flyyyyying", which is a member cheering and contains the word "buy".
+RE_PRE_INSTRUMENT = re.compile(r"^(gold|xau|xauusd\w*|xau/?usd)$", re.I)
+_PRE_FILLER = {
+    # timing / imperative
+    "now", "here", "soon", "ready", "incoming", "active", "running", "live",
+    "again", "another", "next", "more",
+    # address
+    "guys", "guy", "team", "everyone", "all", "please", "pls", "friends",
+    # hedging the operator adds to a heads-up
+    "slowly", "slow", "small", "careful", "carefully", "light", "lightly",
+    "scalping", "scalp", "scalp​", "quick", "fast",
+    "high", "low", "risk", "risky", "only", "some",
+    # shape words that carry no levels
+    "zone", "zones", "area", "setup", "signal", "signals", "alert", "entry",
+    "entries", "position", "positions", "order", "orders", "market", "trade",
+    "trades", "idea",
+    # connective filler
+    "lets", "let", "us", "we", "im", "i", "am", "going", "go", "to", "the",
+    "a", "on", "in", "at", "for", "and", "is", "it", "this", "that", "with",
+    "from", "of", "s", "will", "be", "can", "may", "look", "looking",
+}
 # Management vocabulary
 RE_CANCEL_OBJECT_EXCLUDE = re.compile(
     r"\b(?:delete|remove)\b[^\n]{0,15}\b(?:message|post|comment|chat|channel|link|it\s+in)\b"
@@ -271,10 +358,25 @@ RE_BE = re.compile(
     r"(?:b\.?/?e\.?|break\s*-?\s*even|breakeven)\b"
     r"|(?:^|[,;!.]\s*|\band\s+)(?:breakeven|break\s*even)\s+(?:now|please|everyone)\b"
     r"|\bgo\s+risk\s*-?\s*free\b", re.I)
+# Verbs operators actually use for "move the stop". The list grew from the
+# 2026-08-24 log: GTMO posted "Adjust SL +20 pips to 4630" and it came out as
+# CHATTER, so the stop never moved. Two separate faults were in that one line —
+# a pip qualifier sitting between the SL token and the price, and several
+# common verbs missing entirely.
+_SL_MOVE_VERB = (r"move|shift|adjust|set|trail|pull|change|update|amend|"
+                 r"revise|put|bring|raise|lower|tighten|"
+                 r"last\s+adjustment\s+of")
+# "+20 pips", "20 points" — the operator says how far as well as where to.
+_PIP_QUALIFIER = r"(?:[+\-]?\s*\d{1,3}\s*(?:pips?|points?|pts)\s*)?"
 RE_MOVE_SL_PRICE = re.compile(
-    r"\b(?:move|shift|adjust|set|trail|pull|last\s+adjustment\s+of)\b[^\n]{0,25}"
-    r"\b(?:sl|s/l|stop\s*loss|stop)\b\s*(?:to|at|->|=|:)?\s*"
-    r"(\d{3,5}(?:\.\d{1,3})?)", re.I)
+    r"\b(?:" + _SL_MOVE_VERB + r")\b[^\n]{0,25}"
+    r"\b(?:sl|s/l|stop\s*loss|stop)\b\s*" + _PIP_QUALIFIER +
+    r"(?:to|at|->|=|:)?\s*(\d{3,5}(?:\.\d{1,3})?)"
+    # Verbless form: "SL to 4630". An explicit directional connector is
+    # REQUIRED here. Allowing a bare "SL 4600" would turn the stop line of
+    # every new signal into a stop-move instruction.
+    r"|\b(?:sl|s/l|stop\s*loss)\b\s*" + _PIP_QUALIFIER +
+    r"(?:to|->|=)\s*(\d{3,5}(?:\.\d{1,3})?)", re.I)
 RE_TP_HIT = re.compile(
     r"\btp\s*\d?\b[^\n]{0,20}\b(hit|smashed|done|reached|secured|complete)"
     r"|\b(hit|smashed|reached)\b[^\n]{0,10}\btp\s*\d?\b"
@@ -329,6 +431,11 @@ class SignalParser:
         self.max_sl_dist    = float(p.get("max_sl_distance", 60.0))
         self.max_tps        = int(p.get("max_tps", 8))
         self.zone_fill      = p.get("zone_fill", "worst")
+        # Widest "a - b" this channel could plausibly mean as one zone.
+        # Above it the pair is a typo or two separate ideas and is collapsed
+        # to the near edge. 30 is deliberately generous: the widest genuine
+        # zone measured across the whole 21,738-message corpus is 20.
+        self.max_zone_width = float(p.get("max_zone_width", 30.0))
         self.max_entry_dev  = float(p.get("max_entry_deviation", 6.0))
         # Applies ONLY to resting (limit/stop) orders. None = no bound, which is
         # the right default: a pending order is meant to sit away from the
@@ -346,6 +453,8 @@ class SignalParser:
         # Longest message still treated as a possible terse instruction when it
         # carries a management verb but matches no intent. Above this it is prose.
         self.mgmt_ambiguous_max_chars = int(p.get("mgmt_ambiguous_max_chars", 40))
+        # Refuse a signal naming an instrument this channel does not trade.
+        self.refuse_foreign = bool(p.get("refuse_foreign_symbol", True))
         # Sender filtering. The export schema has no sender_id, so this cannot be
         # exercised in replay, but Telethon exposes it live at zero cost. With an
         # allowlist configured, a member typing "close all" can no longer flatten
@@ -353,6 +462,15 @@ class SignalParser:
         self.operator_ids   = {str(x) for x in p.get("operator_sender_ids", [])}
         self.require_sender = bool(p.get("require_sender_verification", False))
         self.assemble_max_chars   = int(p.get("assemble_max_fragment_chars", 64))
+        # Bare directional calls. On by default: the whole point of watching a
+        # scalping channel is to be in when the operator is, and several of
+        # them post the direction before the levels.
+        self.pre_signal          = bool(p.get("pre_signal", True))
+        self.pre_signal_max_chars = int(p.get("pre_signal_max_chars", 64))
+        # Its own floor: 0.70 is the score for a bare "Sell gold" with no
+        # "now", which is still a real instruction. The channel's
+        # min_confidence is tuned for full signals and would refuse it.
+        self.pre_signal_min_conf  = float(p.get("pre_signal_min_confidence", 0.65))
         self.assemble_max_parts   = int(p.get("assemble_max_parts", 4))
     # ── public ────────────────────────────────────────────────────────────────
     MANAGEMENT_INTENTS = (Intent.CANCEL_PENDING, Intent.CLOSE_ALL,
@@ -431,6 +549,19 @@ class SignalParser:
             res.notes.append("management verb in a short imperative that matched "
                              "no intent; deferring to the AI fallback")
             return res
+        # 3c. A bare directional call, posted ahead of the levels. This must sit
+        #     ABOVE the len(t) < 25 rule below: "Sell gold" is ten characters
+        #     and was being binned as chatter, which is how Lion Trading's
+        #     87-second head start was thrown away on 2026-08-25.
+        pre = self._try_pre_signal(t)
+        if pre is not None:
+            sig, conf = pre
+            res.intent, res.signal, res.confidence = Intent.PRE_SIGNAL, sig, conf
+            res.notes.append("bare directional call: no levels posted yet")
+            self._check_sender(res, sender_id)
+            self._validate(res, msg_dt=msg_dt, market_price=None, now=now)
+            return res
+
         # 4. Marketing / greetings / member talk.
         if RE_PROMO.search(t) or len(t) < 25:
             res.intent, res.confidence = Intent.CHATTER, 0.8
@@ -443,6 +574,54 @@ class SignalParser:
             return res
         res.intent, res.confidence = Intent.CHATTER, 0.6
         return res
+    # ── bare directional calls ────────────────────────────────────────────────
+
+    def _try_pre_signal(self, t: str) -> Optional[tuple]:
+        """A direction with no levels: "Gold buy now", "Sell gold".
+
+        Returns (Signal, confidence) or None. Deliberately strict — see the
+        note on _PRE_FILLER. Every word has to be recognised, so a message
+        gains nothing by being short.
+        """
+        if not self.pre_signal or len(t) > self.pre_signal_max_chars:
+            return None
+        d = self._direction(t)
+        if not d:
+            return None
+        # Any number at all disqualifies it. A bare call has no levels, and a
+        # message with a price that failed to parse as a signal is a different
+        # problem that already routes to the AI fallback.
+        if re.search(r"\d", t):
+            return None
+        if self.has_sl_token(t) or self.has_tp_token(t):
+            return None
+        for guard in (RE_QUESTION, RE_FIRST_PERSON_PAST, RE_TP_HIT,
+                      RE_HYPOTHETICAL, RE_PROMO, RE_MGMT_SHAPED):
+            if guard.search(t):
+                return None
+        words = [w for w in re.split(r"[^A-Za-z/]+", t) if w]
+        if not words:
+            return None
+        seen_instrument = False
+        for w in words:
+            lw = w.lower()
+            if RE_BUY.fullmatch(w) or RE_SELL.fullmatch(w):
+                continue
+            if RE_PRE_INSTRUMENT.match(w):
+                seen_instrument = True
+                continue
+            if lw in _PRE_FILLER:
+                continue
+            return None                 # an unrecognised word: not a bare call
+        explicit = bool(RE_MARKET.search(t))
+        if not (explicit or seen_instrument):
+            # A lone "buy" with no instrument and no "now" is not an order.
+            return None
+        sig = Signal(symbol=self.symbol, direction=d,
+                     order_type=OrderType.MARKET, needs_market_entry=True,
+                     raw_text=t)
+        return sig, (0.85 if (explicit and seen_instrument) else 0.7)
+
     # ── signal extraction ─────────────────────────────────────────────────────
     def _prices(self, t: str) -> list[float]:
         out = []
@@ -491,12 +670,86 @@ class SignalParser:
             notes.append("SL expressed in pips relative to an unposted candle")
         return None, notes
 
+    @staticmethod
+    def _sl_wrong_side(s) -> bool:
+        return ((s.direction == "BUY" and s.sl >= s.entry) or
+                (s.direction == "SELL" and s.sl <= s.entry))
+
+    def _sl_is_implausible(self, s) -> bool:
+        """A posted stop that cannot be what the operator meant."""
+        if self._sl_wrong_side(s):
+            return True
+        return abs(s.entry - s.sl) > self.max_sl_dist
+
+    @staticmethod
+    def _tps_agree_with_direction(s) -> bool:
+        """Every posted target on the profitable side of the entry.
+
+        This is the consistency check that makes rescuing a mistyped stop safe.
+        If the targets also disagree with the direction, the message was not
+        parsed correctly and must be refused, not repaired.
+        """
+        if not s.tps or s.entry is None:
+            return False
+        if s.direction == "BUY":
+            return all(float(t) > float(s.entry) for t in s.tps)
+        return all(float(t) < float(s.entry) for t in s.tps)
+
     def has_sl_token(self, t: str) -> bool:
         return self._extract_sl(t)[0] is not None
 
     def has_tp_token(self, t: str) -> bool:
         tps, runner, _ = self._extract_tps(t, None, None)
         return bool(tps) or runner
+
+    def _targets_block(self, t: str) -> list[float]:
+        """Read an unlabelled target list sitting under a 'Targets:' header.
+
+        Green Pips Zone (-1002145295870) posts every ticket as
+
+            Entry → 4322
+            Targets:
+            ✅ 4319
+            ✅ 4316
+            ...
+            SL → 4332
+
+        The target lines carry no TP token at all, so RE_TP sees nothing and
+        the signal reaches the executor with a stop and no destination — which
+        _handle_entry refuses outright ("All TPs passed"). The channel is
+        unmeasurable without this.
+
+        The rule is deliberately narrow, and only runs when RE_TP found
+        nothing anywhere in the message:
+          - a line must be a bare 'Targets:' / 'TP:' header, nothing else on it
+          - collection stops at the first blank line, or at any line carrying
+            a stop-loss or entry token, or at any line holding more than one
+            number
+          - a collected line must be exactly one in-range price plus
+            decoration (emoji, markdown, bullets) and no letters
+        Across the whole 21,738-message corpus only 118 messages contain such
+        a header, 116 of them from this one channel.
+        """
+        out: list[float] = []
+        started = False
+        for ln in t.splitlines():
+            s = ln.strip()
+            if not started:
+                if _RE_TARGETS_HDR.match(s):
+                    started = True
+                continue
+            if not s:
+                break
+            if re.search(r"[A-Za-z]", s):
+                break
+            nums = re.findall(r"\d{3,5}(?:\.\d{1,3})?", s)
+            if len(nums) != 1:
+                break
+            v = float(nums[0])
+            if not (self.price_min <= v <= self.price_max):
+                break
+            out.append(v)
+        return out
     def _extract_tps(self, t: str, entry_hint: Optional[float],
                      direction: Optional[str]) -> tuple[list[float], bool, list[str]]:
         tps, runner, notes = [], False, []
@@ -508,6 +761,8 @@ class SignalParser:
             v = float(raw)
             if self.price_min <= v <= self.price_max:
                 tps.append(v)
+        if not tps:
+            tps.extend(self._targets_block(t))
         # "TP every 100 pips" -> synthesise the ladder between entry and final TP.
         if not runner and re.search(r"(?:\btp\s*\d?\s*[:.]?|/)\s*open\b", t, re.I):
             runner = True
@@ -534,7 +789,8 @@ class SignalParser:
                 seen.add(v)
                 clean.append(v)
         return clean[: self.max_tps], runner, notes
-    def _extract_entry(self, t: str, sl: Optional[float], tps: list[float]
+    def _extract_entry(self, t: str, sl: Optional[float], tps: list[float],
+                       direction_hint: Optional[str] = None
                        ) -> tuple[Optional[float], Optional[float], bool, list[str]]:
         """Return (low, high, is_zone, notes). Excludes SL/TP numbers."""
         notes: list[str] = []
@@ -548,9 +804,15 @@ class SignalParser:
         head = "\n".join(lines) if lines else t
         # a) explicit zone: "4410.4 - 4415", "4420/4425", "4054 OR 4050",
         #    "b/n 4385-4390", "4306/7"
+        # "_" and "__" are zone separators for two channels and MUST be here:
+        #   John Wick FX  "GOLD BUY NOW 4816__4814"
+        #   Emily Pips    "Price Open @ 4097_4000"
+        # Without them both channels read as a single entry at one edge. They
+        # are deliberately NOT in the markdown-stripping rule in normalize()
+        # for the same reason, from the opposite direction.
         zone = re.search(
             r"(\d{3,5}(?:\.\d{1,3})?)"
-            r"\s*(?:-|/|or\b|\s+to\s+|b/n)\s*"
+            r"\s*(?:-|/|_+|or\b|\s+to\s+|b/n)\s*"
             r"(\d{1,5}(?:\.\d{1,3})?)"
             r"(?!\s*\+?\s*(?:pips?|points?|%))", head, re.I)
         if zone:
@@ -565,7 +827,42 @@ class SignalParser:
             if (self.price_min <= a <= self.price_max
                     and self.price_min <= b <= self.price_max
                     and a not in excluded and b not in excluded):
-                return min(a, b), max(a, b), True, notes
+                lo_, hi_ = min(a, b), max(a, b)
+                # A "zone" wider than any operator would really quote is a
+                # typo or two separate ideas, not a range. Real examples:
+                #   Emily Pips   "SELL 4060 / 4163"   (4163 means 4063)
+                #   Emily Pips   "Price Open @ 4097_4000"  (4000 means 4090)
+                #   Mr William   "SELL Zone 4200 OR 4403"  (two ideas)
+                # Treating those as a range puts one leg hundreds of dollars
+                # off market. Collapse to the edge nearest the market instead
+                # of discarding the signal: the near edge is the number the
+                # operator certainly meant, and it is also the conservative
+                # fill under zone_fill "worst".
+                if (hi_ - lo_) > self.max_zone_width:
+                    # Which bound did he mean? The stop answers it: an operator
+                    # places his stop a short way BEYOND the entry, so the bound
+                    # sitting near the stop is the real one and the far bound is
+                    # the typo.
+                    #   "SELL 4060 / 4163" SL 4068 -> |4060-4068|=8 vs 95  -> 4060
+                    #   "Zone 4200 OR 4403" SL 4210 -> |4200-4210|=10 vs 193 -> 4200
+                    #   "Price Open @ 4097_4000" SL 4107 -> 10 vs 107     -> 4097
+                    # With no stop, the nearest target answers the same way.
+                    # With neither, fall back to the edge the market reaches
+                    # first for this direction.
+                    ref = sl if sl else (min(tps, key=lambda x: abs(x - lo_))
+                                         if tps else None)
+                    if ref is not None:
+                        keep = min((lo_, hi_), key=lambda v: abs(v - float(ref)))
+                        how = f"it sits nearest the stop/target at {float(ref)}"
+                    else:
+                        keep = hi_ if direction_hint == "BUY" else lo_
+                        how = "no stop or target to disambiguate; took the near edge"
+                    notes.append(
+                        f"zone {lo_}-{hi_} is {hi_ - lo_:.2f} wide, above "
+                        f"max_zone_width {self.max_zone_width}: reading it as a "
+                        f"single entry at {keep} because {how}")
+                    return keep, keep, False, notes
+                return lo_, hi_, True, notes
         # b) single price after an entry label
         lbl = RE_ENTRY_LABEL.search(head)
         if lbl:
@@ -609,13 +906,13 @@ class SignalParser:
             return None, 0.0, []
         sl, n1 = self._extract_sl(t)
         # entry_hint needed before TP ladder synthesis; do a cheap first pass.
-        lo0, hi0, _, _ = self._extract_entry(t, sl, [])
+        lo0, hi0, _, _ = self._extract_entry(t, sl, [], direction)
         # Anchor the synthetic ladder on the fill we actually expect, not on the
         # low bound. For a BUY zone the worst fill is the HIGH bound, so anchoring
         # on lo0 put every rung one zone-width too close.
         tps, runner, n2 = self._extract_tps(
             t, self._resolve_entry(lo0, hi0, direction), direction)
-        lo, hi, is_zone, n3 = self._extract_entry(t, sl, tps)
+        lo, hi, is_zone, n3 = self._extract_entry(t, sl, tps, direction)
         # A signal needs a direction plus at least one of {SL, TP}, unless the
         # channel is configured to allow bare calls (which then hand off to
         # core/bare_trade_watcher.py for its own timed exit).
@@ -632,12 +929,13 @@ class SignalParser:
         # that the operator is talking about a different instrument entirely.
         sym = self.symbol
         mentioned = self._symbol(t)
-        if mentioned and not self._same_instrument(mentioned, sym):
-            n1 = n1 + [f"message mentions {mentioned} but channel is configured "
-                       f"for {sym}; using the channel symbol"]
+        foreign = bool(mentioned and not self._same_instrument(mentioned, sym))
+        if foreign:
+            n1 = n1 + [f"message names {mentioned} but the channel trades {sym}"]
         sig = Signal(symbol=sym, direction=direction, is_zone=is_zone,
                      entry_low=lo, entry_high=hi, sl=sl, tps=tps,
-                     has_open_runner=runner, raw_text=t[:400])
+                     has_open_runner=runner, raw_text=t[:400],
+                     foreign_symbol=(mentioned if foreign else None))
         sig.entry = self._resolve_entry(lo, hi, direction)
         sig.order_type = self._order_type(t, direction)
         if sl is None and not tps and not runner:
@@ -752,7 +1050,8 @@ class SignalParser:
         # substring that CLOSE_ALL matches.
         m = RE_MOVE_SL_PRICE.search(t)
         if m:
-            v = float(m.group(1))
+            # Two alternatives, so the price is in whichever group matched.
+            v = float(m.group(1) or m.group(2))
             if self.price_min <= v <= self.price_max:
                 return emit(Intent.MOVE_SL_PRICE,
                             Action(price=v, scope=self.close_scope), 0.9, m)
@@ -783,10 +1082,54 @@ class SignalParser:
             return emit(Intent.MOVE_SL_BE, Action(scope=self.close_scope), 0.88, m)
         return None
     # ── validation ────────────────────────────────────────────────────────────
+    def _check_freshness(self, res: ParsedMessage, msg_dt: Optional[datetime],
+                          now: Optional[datetime]) -> None:
+        """Age gate. Lifted out of _validate so PRE_SIGNAL can reuse it.
+
+        A stale bare call is the worst kind: acting on "gold buy now" from
+        twenty minutes ago means buying a move that already happened.
+        """
+        r = res.rejected_reasons
+        if msg_dt is not None:
+            ref = now or datetime.now(timezone.utc)
+            # Both sides are treated as UTC. A naive datetime from an export is
+            # assumed UTC; the live listener must pass tz-aware values.
+            if msg_dt.tzinfo is None:
+                msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+            if ref.tzinfo is None:
+                ref = ref.replace(tzinfo=timezone.utc)
+            age = (ref - msg_dt).total_seconds()
+            if age > self.max_age_sec:
+                r.append(f"message is {age:.0f}s old, max {self.max_age_sec}s")
+            elif age < -self.future_tolerance_sec:
+                # A message dated in the future means the clocks disagree. The
+                # usual cause is a naive local timestamp being compared against
+                # UTC: at UTC+3 every message looks 3 h early, age goes negative,
+                # and the staleness gate silently stops rejecting anything.
+                # Fail closed instead of trusting a clock we cannot verify.
+                r.append(f"message is dated {-age:.0f}s in the future; "
+                         f"timestamp is not tz-aware UTC")
+
     def _validate(self, res: ParsedMessage, msg_dt: Optional[datetime],
                   market_price: Optional[float], now: Optional[datetime]):
         s = res.signal
         r = res.rejected_reasons
+        # A bare directional call has no levels by definition, so every gate
+        # that reasons about levels — requires_sl, the SL distance band, TP
+        # geometry, entry deviation — would refuse all of them. Only the
+        # checks that still mean something are run: is it fresh, is it this
+        # instrument, and is the sender allowed to speak for the channel.
+        # Freshness matters MORE here, not less: acting on a stale "buy now"
+        # means entering a move that has already happened.
+        if res.intent == Intent.PRE_SIGNAL:
+            self._check_freshness(res, msg_dt, now)
+            if self.refuse_foreign and getattr(s, "foreign_symbol", None):
+                r.append(f"message is about {s.foreign_symbol} but this channel "
+                         f"trades {self.symbol}")
+            if res.confidence < self.pre_signal_min_conf:
+                r.append(f"confidence {res.confidence:.2f} < "
+                         f"pre_signal_min_confidence {self.pre_signal_min_conf:.2f}")
+            return
         if res.confidence < self.min_conf:
             r.append(f"confidence {res.confidence:.2f} < min_confidence {self.min_conf:.2f}")
         if s.entry is None:
@@ -808,14 +1151,69 @@ class SignalParser:
         # operator did post a reference price.
         if s.order_type == OrderType.MARKET and not res.rejected_reasons:
             s.needs_market_entry = True
+        # --- wrong instrument ------------------------------------------------
+        # Every price gate here is calibrated for ONE instrument: price_min /
+        # price_max, pip_value, and the 3-to-5-digit price pattern. Fed a
+        # EURUSD post, "1.0850" is read as 850.0 and the whole signal is
+        # quietly mis-scaled. Refuse rather than route another instrument's
+        # numbers to this channel's symbol.
+        if self.refuse_foreign and getattr(s, "foreign_symbol", None):
+            r.append(f"message is about {s.foreign_symbol} but this channel "
+                     f"trades {s.symbol}; refusing cross-instrument signal")
+
         # --- stop loss -------------------------------------------------------
+        # A stop that parsed but cannot be true is the same problem as a stop
+        # that did not parse: we know where to enter and not where to exit.
+        # Dropping the whole signal for one mistyped number wastes a call the
+        # operator got right in every other respect, so hand those to the same
+        # fallback rather than refusing them.
+        #
+        # Only for a stop that is IMPLAUSIBLE, never one that is merely
+        # inconvenient, and only when the rest of the message is self-
+        # consistent - every target on the correct side of the entry. Without
+        # that check a wholly mis-parsed message would be rescued into a trade,
+        # which is the opposite of what this is for.
+        #
+        # AND ONLY WHEN THE ENTRY CAME FROM THE MESSAGE. If the entry is a
+        # market fill we supplied, a stop on the wrong side of it usually means
+        # THE MARKET MOVED PAST THE OPERATOR'S LEVELS, not that he mistyped:
+        #   "GOLD SELL a now / SL 4050 / TP 3900" filled at 4060
+        # His stop and target are both coherent for an entry near 4000-4040.
+        # The signal is stale, and a stale signal must be refused, not given a
+        # synthetic stop and traded at a price he never called.
+        if (s.sl is not None and s.entry is not None and self.default_sl_pips
+                and not getattr(s, "needs_market_entry", False)
+                and self._sl_is_implausible(s)
+                and self._tps_agree_with_direction(s)):
+            why = ("on the wrong side" if self._sl_wrong_side(s)
+                   else f"{abs(s.entry - s.sl):.2f} away, above max "
+                        f"{self.max_sl_dist}")
+            res.notes.append(
+                f"posted stop {s.sl} is unusable against entry {s.entry} "
+                f"({why}); every target is on the correct side, so it is "
+                f"treated as a typo and synthesised")
+            s.sl = None
+
         if s.sl is None:
             if self.requires_sl and not self.default_sl_pips:
                 r.append("no stop loss in message and requires_sl=true")
-            elif self.default_sl_pips and s.entry:
+            elif self.default_sl_pips and (s.entry or s.entry_low or s.entry_high):
                 d = float(self.default_sl_pips) * self.pip_value
-                s.sl = round(s.entry - d if s.direction == "BUY" else s.entry + d, 3)
-                res.notes.append(f"SL synthesised at {self.default_sl_pips} pips")
+                # Measure from the PROTECTIVE edge of the zone, not from the
+                # fill. On a sell zone 4580-4585 the stop belongs above 4585;
+                # measuring from entry (4580, the worst fill) put it at 4588,
+                # three dollars above the zone instead of eight, so it sat
+                # inside the operator's own entry band and any wick through
+                # the zone would take it.
+                if s.direction == "BUY":
+                    ref = s.entry_low if s.entry_low is not None else s.entry
+                    s.sl = round(float(ref) - d, 3)
+                else:
+                    ref = s.entry_high if s.entry_high is not None else s.entry
+                    s.sl = round(float(ref) + d, 3)
+                res.notes.append(
+                    f"SL synthesised at {self.default_sl_pips} pips from "
+                    f"{float(ref)}: the operator withheld it")
         if s.sl is not None and s.entry is not None:
             wrong = (s.direction == "BUY"  and s.sl >= s.entry) or \
                     (s.direction == "SELL" and s.sl <= s.entry)
@@ -856,26 +1254,8 @@ class SignalParser:
                          "entry; message is internally inconsistent")
             else:
                 s.tps.sort(reverse=(s.direction == "SELL"))
-        # --- freshness -------------------------------------------------------
-        if msg_dt is not None:
-            ref = now or datetime.now(timezone.utc)
-            # Both sides are treated as UTC. A naive datetime from an export is
-            # assumed UTC; the live listener must pass tz-aware values.
-            if msg_dt.tzinfo is None:
-                msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-            if ref.tzinfo is None:
-                ref = ref.replace(tzinfo=timezone.utc)
-            age = (ref - msg_dt).total_seconds()
-            if age > self.max_age_sec:
-                r.append(f"message is {age:.0f}s old, max {self.max_age_sec}s")
-            elif age < -self.future_tolerance_sec:
-                # A message dated in the future means the clocks disagree. The
-                # usual cause is a naive local timestamp being compared against
-                # UTC: at UTC+3 every message looks 3 h early, age goes negative,
-                # and the staleness gate silently stops rejecting anything.
-                # Fail closed instead of trusting a clock we cannot verify.
-                r.append(f"message is dated {-age:.0f}s in the future; "
-                         f"timestamp is not tz-aware UTC")
+        self._check_freshness(res, msg_dt, now)
+
         # --- slippage gate ---------------------------------------------------
         # Resolve the order type FIRST. max_entry_deviation is a slippage
         # defence, and slippage only exists for an order that fills NOW. A
@@ -1000,6 +1380,16 @@ class SignalAssembler:
         # half-built fragment.
         if direct.intent == Intent.NEW_SIGNAL and self._complete(direct.signal):
             self._pending = None
+            return direct
+        # A bare directional call opens a fragment AND is emitted immediately.
+        # Emitting it is the entire point: the operator is in the trade now and
+        # the levels arrive a minute later, by which time the price has moved.
+        # The buffer stays open so the levels still assemble into the full
+        # signal, and the executor's _upgrade_bare_trades converts the bare
+        # position rather than opening a second one.
+        if direct.intent == Intent.PRE_SIGNAL:
+            if len(t) <= self.parser.assemble_max_chars:
+                self._pending = {"parts": [text], "dt": msg_dt, "id": msg_id}
             return direct
         if direct.intent not in (Intent.NEW_SIGNAL, Intent.CHATTER, Intent.UNKNOWN):
             return direct   # management instructions pass straight through

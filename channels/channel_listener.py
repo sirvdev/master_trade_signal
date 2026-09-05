@@ -43,6 +43,13 @@ class ChannelListener:
         # only ever sees messages the deterministic layer abstained on, so it
         # needs to know this operator's house style to judge them.
         self.ai_hint = build_channel_hint(channel.name, channel.parser or {})
+        # Per-channel AI fallback switch. Default true: every channel that
+        # worked before this flag existed keeps working exactly as it did.
+        self.ai_enabled = bool((channel.parser or {}).get("ai_fallback", True))
+        if not self.ai_enabled:
+            logger.info(f"[LISTENER] {channel.name}: AI fallback disabled; "
+                        f"messages the deterministic parser abstains on are "
+                        f"dropped rather than guessed at")
         # Shared across listeners when ChannelManager passes one in; otherwise
         # per-channel. The skew is a property of the machine, not the channel.
         self.clock = ClockSkew()
@@ -62,8 +69,14 @@ class ChannelListener:
 
         logger.info(f"[LISTENER] Registered handler for channel: {self.channel.name} ({self.channel.id})")
 
-    def _warn_if_clock_wrong(self, every_sec: int = 600):
-        """Escalate a bad clock at most once per interval, per channel."""
+    async def _warn_if_clock_wrong(self, every_sec: int = 600):
+        """Escalate a bad clock at most once per interval, per channel.
+
+        This also goes to Telegram, not just the log. A wrong clock silently
+        refuses every signal, so the failure mode is "nothing happens", which is
+        indistinguishable from a quiet market unless someone is reading the log
+        at that moment. Nobody is, at 3am.
+        """
         if not self.clock.is_significant:
             return
         import time
@@ -71,7 +84,17 @@ class ChannelListener:
         if now - self._last_clock_warn < every_sec:
             return
         self._last_clock_warn = now
-        logger.error(f"[CLOCK] {self.clock.diagnosis()}")
+        diag = self.clock.diagnosis()
+        logger.error(f"[CLOCK] {diag}")
+        notifier = getattr(self.executor, "notifier", None)
+        if notifier:
+            try:
+                await notifier.send(
+                    f"\U0001f552 <b>System clock is wrong</b>\n{diag}\n\n"
+                    f"<b>Signals are being refused as stale until this is "
+                    f"fixed.</b> Run <code>w32tm /resync /force</code>.")
+            except Exception as e:
+                logger.debug(f"[CLOCK] notify failed: {e}")
 
     def _parse_channel_id(self):
         """Convert channel ID string to int or leave as username."""
@@ -80,6 +103,53 @@ class ChannelListener:
         except ValueError:
             return self.channel.id
 
+    async def _price_is_plausible(self, signal) -> tuple[bool, str]:
+        """Is this AI-parsed entry even about the instrument we trade?
+
+        The deterministic parser enforces max_entry_deviation; the AI path does
+        not go through the parser, so until now nothing checked its numbers at
+        all. That matters because some channels are mixed feeds. One of the
+        gold channels also posts Indian index options ("BUY DIXON 14500 CE
+        ABOVE 391, TARGET 345/430, SL PAID"). The deterministic layer correctly
+        abstains on those, which sends them straight to the AI with
+        default_symbol=XAUUSDm, and a helpful AI will happily return a XAUUSDm
+        buy at 391.
+
+        This is NOT the slippage gate. It is a wide band whose only job is to
+        catch numbers from a different instrument, so it is expressed as a
+        percentage of the live price rather than in dollars: 5% of gold is
+        ~230, and no real gold signal is ever posted 230 away from spot, while
+        an option priced at 391 is 91% away. Fails open when there is no quote,
+        for the same reason the slippage gate does: refusing every signal
+        because the bridge is briefly quiet is worse than the thing it guards.
+        """
+        if signal.signal_type not in ("entry", "pre_announcement"):
+            return True, ""
+        band = float((self.channel.parser or {}).get("ai_sanity_band_pct", 5.0))
+        if band <= 0:
+            return True, ""
+        levels = [x for x in (signal.entry_price, signal.entry_low,
+                              signal.entry_high, signal.stop_loss)
+                  if isinstance(x, (int, float)) and x]
+        levels += [x for x in (signal.take_profits or [])
+                   if isinstance(x, (int, float)) and x]
+        if not levels:
+            return True, ""
+        price = await self.executor.bridge.get_price(
+            self.channel.symbol, (signal.direction or "buy").lower())
+        if not price:
+            logger.info(f"[{self.channel.name}] no live price: AI sanity "
+                        f"band skipped")
+            return True, ""
+        tol = abs(float(price)) * band / 100.0
+        far = [x for x in levels if abs(float(x) - float(price)) > tol]
+        if not far:
+            return True, ""
+        return False, (f"AI-parsed level(s) {sorted(set(far))[:4]} are more "
+                       f"than {band:g}% from {self.channel.symbol} at "
+                       f"{price:g}; this message is probably about a "
+                       f"different instrument")
+
     async def _process(self, msg: Message):
         if not msg or not msg.text:
             return
@@ -87,7 +157,8 @@ class ChannelListener:
         if len(text) < 2:
             return
 
-        ts = msg.date.strftime("%H:%M:%S") if msg.date else "?"
+        # msg.date is UTC. Mark it, so a log line is never read as wall clock.
+        ts = msg.date.strftime("%H:%M:%SZ") if msg.date else "?"
         logger.info(
             f"[{self.channel.name}] [{ts}] msg_id={msg.id}: "
             f"{text[:80].replace(chr(10), ' ')}"
@@ -108,7 +179,7 @@ class ChannelListener:
         # staleness. A wrong clock makes every signal look hours old and the
         # raw age ("message is 25581s old") does not say why.
         self.clock.observe(msg_dt)
-        self._warn_if_clock_wrong()
+        await self._warn_if_clock_wrong()
         now_ref = self.clock.adjusted_now()   # None unless compensation is on
 
         try:
@@ -144,11 +215,31 @@ class ChannelListener:
             # A staleness refusal on a machine with a known-bad clock is almost
             # certainly the clock, not the signal. Say so on the same line so
             # nobody has to correlate it with a warning further up the file.
+            if res.rejected_reasons and res.intent == Intent.NEW_SIGNAL:
+                try:
+                    self.executor.db.log_skipped_signal(
+                        self.channel.id, msg.id, res.intent.value,
+                        "; ".join(res.rejected_reasons))
+                except Exception:
+                    pass
             if any("old" in x or "future" in x for x in res.rejected_reasons):
                 diag = self.clock.diagnosis()
                 if diag:
                     logger.error(f"[{self.channel.name}] the refusal above is "
                                  f"most likely NOT the signal: {diag}")
+
+            if should_fallback(res) and not self.ai_enabled:
+                # Deliberately dropped, not silently lost. Some channels post
+                # running commentary in a language the AI will happily
+                # misread as an order: "Don't buy gold here, price 4335 k upr
+                # stable nhi hoti tab tak buy order nhi lena" is an
+                # instruction NOT to buy, and a model reading the English
+                # fragments returns a buy at 4335. Where the deterministic
+                # parser already reads that channel's real signals cleanly,
+                # the fallback adds nothing and can only invent trades.
+                logger.info(f"[{self.channel.name}] deterministic layer "
+                            f"abstained and ai_fallback=false → dropped")
+                return
 
             if should_fallback(res):
                 logger.info(f"[{self.channel.name}] deterministic layer "
@@ -179,6 +270,16 @@ class ChannelListener:
 
             if signal is None:
                 return          # chatter, refused, or no handler. Already logged.
+
+            ok, why = await self._price_is_plausible(signal)
+            if not ok:
+                logger.warning(f"[{self.channel.name}] AI signal REFUSED: {why}")
+                try:
+                    self.executor.db.log_skipped_signal(
+                        self.channel.id, msg.id, "ai_entry", why)
+                except Exception:
+                    pass
+                return
 
             logger.info(
                 f"[{self.channel.name}] Parsed → "

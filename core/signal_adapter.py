@@ -34,6 +34,10 @@ ALLOW_STOP_ORDERS = os.getenv("ALLOW_STOP_ORDERS", "false").lower() == "true"
 # ParsedMessage.intent -> ParsedSignal.signal_type
 _INTENT_MAP = {
     Intent.NEW_SIGNAL:     "entry",
+    # A bare directional call. The executor opens a minimum-size position with
+    # a wide protective stop and no target, and upgrades it when the levels
+    # arrive. See _handle_pre_announcement.
+    Intent.PRE_SIGNAL:     "pre_announcement",
     Intent.CANCEL_PENDING: "cancel_pending",   # handler added to the executor
     Intent.CLOSE_ALL:      "close_all",
     Intent.CLOSE_PARTIAL:  "close_partial",    # handler added to the executor

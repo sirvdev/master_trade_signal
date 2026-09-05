@@ -125,6 +125,50 @@ class MT5FileBridge:
 
     # ── Core command layer ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_response(raw: str, request_id: str) -> Optional[Dict]:
+        """The EA's reply, or None if it genuinely cannot be read.
+
+        WriteResponse in the EA emits ONE json object with request_id inside
+        it, so the whole file parses on its own. The old code tried a legacy
+        "{request_id}|{json}" tagged-line format FIRST and split on the first
+        pipe, which shredded any reply whose payload legitimately contains a
+        pipe. Exactly one action echoes text we authored — get_all_orders
+        returns ORDER_COMMENT — and our own order_comment() used '|' as its
+        field separator, so every orders reply came back as
+
+            5E15A7|t2","time_placed":...
+
+        and failed to parse. Every other action was unaffected, which is why
+        the bridge looked healthy while the orders pool was permanently
+        unreadable.
+
+        Whole-file JSON is tried first now. The tagged-line form is still
+        supported for an older EA, but only when the file is not valid JSON,
+        and it rsplits so a pipe inside the payload cannot break it.
+        """
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except Exception:
+                pass
+            if request_id in line and "|" in line:
+                # Legacy tagged line. The id is the FIRST field, so take
+                # everything after the first separator that still parses.
+                head, _, tail = line.partition("|")
+                try:
+                    return json.loads(tail.strip())
+                except Exception:
+                    continue
+        return None
+
     async def _send_command(self, command: Dict, timeout: float = 30.0) -> Dict:
         if self.demo_mode:
             return await self._demo_command(command)
@@ -154,17 +198,29 @@ class MT5FileBridge:
                 continue
             try:
                 raw = resp_file.read_text(encoding="utf-8", errors="ignore").strip()
-                # Response file may contain tagged line: {request_id}|{json}
-                for line in raw.splitlines():
-                    if request_id in line:
-                        payload = line.split("|", 1)[-1].strip()
-                        resp_file.unlink(missing_ok=True)
-                        return json.loads(payload)
-                # Fallback: try parsing the whole file
-                resp_file.unlink(missing_ok=True)
-                return json.loads(raw)
             except Exception as e:
-                logger.debug(f"[BRIDGE] Response parse error {request_id}: {e}")
+                logger.debug(f"[BRIDGE] Response read error {request_id}: {e}")
+                continue
+            if not raw:
+                continue        # still being written; look again next poll
+
+            parsed = self._parse_response(raw, request_id)
+            if parsed is None:
+                # Unparseable. Log it LOUDLY and stop waiting: the EA has
+                # already answered, so polling to the full timeout tells us
+                # nothing and costs 30 seconds. The old code also deleted the
+                # file before parsing, so a parse failure destroyed the
+                # evidence and then spun until timeout — which is exactly how
+                # get_all_orders "timed out" 777 times on 2026-08-25 while the
+                # EA was answering it correctly every time.
+                logger.error(
+                    "[BRIDGE] %s (%s) answered with something this client "
+                    "cannot parse; first 200 chars: %s",
+                    request_id, command.get("action"), raw[:200])
+                resp_file.unlink(missing_ok=True)
+                return {"status": "error", "error": "unparseable response"}
+            resp_file.unlink(missing_ok=True)
+            return parsed
 
         resp_file.unlink(missing_ok=True)
         logger.error(f"[BRIDGE] {request_id} ({command.get('action')}) timed out after {timeout}s")
