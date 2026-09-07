@@ -127,9 +127,16 @@ class BareTradeWatcher:
             profit = await self._profit(ticket)
             if cut < min_lot or (lot - cut) < min_lot:
                 if await self.bridge.close_position(ticket):
-                    self.db.update_position_closed(ticket, profit, "bare_scaleout")
+                    # Book only if THIS call closed the row. The monitor runs
+                    # on its own 5-second cycle from a snapshot taken before
+                    # this close, and would otherwise book the same money too.
+                    if self.db.update_position_closed(ticket, profit,
+                                                      "bare_scaleout"):
+                        self.db.book_realised(sig["channel_id"], profit,
+                                              "bare scale-out")
+                        self.db.mark_pnl_booked(ticket, profit)
+                        pnl += profit
                     closed += 1
-                    pnl += profit
                     trades_log.info(
                         f"BARE_SCALEOUT_CLOSE signal={sig['signal_id']} "
                         f"ticket={ticket} step={step} lot={lot} pnl={profit:.2f}")
@@ -156,21 +163,32 @@ class BareTradeWatcher:
 
     async def _close_remaining(self, sig, step: int):
         positions = self.db.get_open_positions(sig["signal_id"])
-        total, wins, losses = 0.0, 0, 0
+        total, wins, losses, failed = 0.0, 0, 0, 0
         for pos in positions:
             ticket = pos["ticket"]
             if not ticket:
                 continue
             profit = await self._profit(ticket)
             if await self.bridge.close_position(ticket):
-                self.db.update_position_closed(ticket, profit, "bare_timeout")
-                total += profit
-                wins += profit > 0
-                losses += profit <= 0
+                if self.db.update_position_closed(ticket, profit, "bare_timeout"):
+                    self.db.book_realised(sig["channel_id"], profit, "bare timeout")
+                    self.db.mark_pnl_booked(ticket, profit)
+                    total += profit
+                    wins += profit > 0
+                    losses += profit <= 0
                 logger.info("[BARE] closed ticket=%s profit=%.2f", ticket, profit)
             else:
+                failed += 1
                 logger.error("[BARE] failed to close ticket=%s", ticket)
 
+        # Only retire the signal if every leg actually closed. Setting this
+        # unconditionally dropped it out of get_bare_signals after ONE failed
+        # bridge call, abandoning the timed exit - the whole point of this
+        # component - and leaving the position on its protective stop alone.
+        if failed:
+            logger.warning("[BARE] signal %s kept open — %d leg(s) would not "
+                           "close; will retry next pass", sig["signal_id"], failed)
+            return
         self.db.update_signal_status(sig["signal_id"], "closed",
                                      "bare_scaleout_complete")
         self._steps.pop(sig["signal_id"], None)

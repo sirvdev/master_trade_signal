@@ -226,7 +226,12 @@ RE_TP = re.compile(
     r"\s*(?:\(\s*\d{1,2}\s*\)|\d{1,2}(?!\d))?"
     r"\s*(?:@|\bat\b)?"
     rf"[\s:.\-=@(){_ARROW}]*"
-    r"(\d{3,5}(?:\.\d{1,3})?|open)"
+    # "open" and "free" both mean an UNCAPPED leg. Mr FullMargin FX writes
+    # "TP   : Free!" on all 180 of his signals, so without this his third leg
+    # was silently dropped and a two-leg trade was opened where he posted
+    # three. This only matches where the TP pattern has ALREADY matched, so
+    # "risk free" and "join our free group" cannot reach it.
+    r"(\d{3,5}(?:\.\d{1,3})?|open|free)"
     r"(?!\s*\+?\s*(?:pips?|points?|%))", re.I)
 RE_TP_EVERY = re.compile(
     r"\btp\b[^\n]{0,20}\bevery\b\s*(\d{2,4})\s*pips?", re.I)
@@ -322,6 +327,24 @@ RE_CLOSE_ALL = re.compile(
     r"|\bfull(?:y)?\s+closed?\b"
     # Lion, 2026-08-19: "Close with small loss it's not good anymore".
     r"|\bclose\s+with\s+(?:a\s+)?(?:small|big|little|tiny)?\s*(?:loss|profit|gain)\b",
+    re.I)
+
+# A close instruction that names the DIRECTION, with the instrument and/or a
+# noun in between: "Close gold buy trade", "Close the gold buys here with
+# loss", "Gold sell trade close". RE_CLOSE_ALL needs its noun immediately
+# after "close", so all of these fell through to UNKNOWN and then to the AI.
+#
+# The direction is captured and HONOURED downstream: _handle_close filters the
+# open signals by it. Emitting this as an undirected close-all would shut the
+# other side of the book on an instruction that never mentioned it, which is
+# worse than missing the message.
+RE_CLOSE_DIRECTIONAL = re.compile(
+    r"\bclose\s+(?:the\s+|all\s+|your\s+|our\s+)?"
+    r"(?:gold\s+|xau\s*/?\s*usd\s+)?"
+    r"\b(buy|sell)s?\b"
+    r"(?:\s+(?:trade|position|order)s?)?"
+    r"|\b(?:gold\s+|xau\s*/?\s*usd\s+)?(buy|sell)s?\s+"
+    r"(?:trade|position|order)s?\s+close(?:d)?\b",
     re.I)
 # Management vocabulary that did NOT match any specific intent above. A short
 # imperative carrying one of these is ambiguous, not chatter: "IF HAPPY CLOSE",
@@ -755,7 +778,7 @@ class SignalParser:
         tps, runner, notes = [], False, []
         for m in RE_TP.finditer(t):
             raw = m.group(1)
-            if raw.lower() == "open":
+            if raw.lower() in ("open", "free"):
                 runner = True
                 continue
             v = float(raw)
@@ -764,7 +787,9 @@ class SignalParser:
         if not tps:
             tps.extend(self._targets_block(t))
         # "TP every 100 pips" -> synthesise the ladder between entry and final TP.
-        if not runner and re.search(r"(?:\btp\s*\d?\s*[:.]?|/)\s*open\b", t, re.I):
+        if not runner and re.search(
+                r"(?:\btp\s*\d?\s*[:.]?|/)\s*open\b"
+                r"|\btp\s*\d?\s*[:.]\s*free\b", t, re.I):
             runner = True
         step_m = RE_TP_EVERY.search(t)
         step_pips = float(step_m.group(1)) if step_m else self.tp_ladder_step
@@ -1077,6 +1102,15 @@ class SignalParser:
         m = RE_CLOSE_ALL.search(t)
         if m:
             return emit(Intent.CLOSE_ALL, Action(scope=self.close_scope), 0.9, m)
+        # Tried AFTER the undirected form on purpose: "close all buy trades"
+        # must read as a plain close-all, not as a directional one that then
+        # filters the book down to one side.
+        m = RE_CLOSE_DIRECTIONAL.search(t)
+        if m:
+            side = (m.group(1) or m.group(2) or "").upper()
+            return emit(Intent.CLOSE_ALL,
+                        Action(scope=self.close_scope, direction=side or None),
+                        0.85, m)
         m = RE_BE.search(t)
         if m:
             return emit(Intent.MOVE_SL_BE, Action(scope=self.close_scope), 0.88, m)

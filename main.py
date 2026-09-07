@@ -241,16 +241,43 @@ async def main():
     logger.info(f"Channels: {[ch.name for ch in enabled_channels]}")
 
     try:
-        results = await asyncio.gather(
-            channel_manager.start(),
-            position_monitor.start(),
-            bare_watcher.start(),
-            return_exceptions=True,
-        )
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                names = ["channel_manager", "position_monitor", "bare_watcher"]
-                logger.error(f"[{names[i]}] crashed: {r}", exc_info=r)
+        # asyncio.gather over three INFINITE loops only returns when all three
+        # finish. If the position monitor died, the listener kept opening
+        # positions with nothing detecting closes, updating P&L, tracking
+        # drawdown or halting anything - and because gather never returned,
+        # the crash was never logged and never notified. Wait for the FIRST
+        # one to stop instead, and treat that as fatal.
+        names = ["channel_manager", "position_monitor", "bare_watcher"]
+        tasks = [asyncio.create_task(c, name=n) for c, n in zip(
+            (channel_manager.start(), position_monitor.start(), bare_watcher.start()),
+            names)]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        for t in done:
+            exc = t.exception() if not t.cancelled() else None
+            who = t.get_name()
+            if exc:
+                logger.critical(f"[{who}] crashed — shutting the rest down", exc_info=exc)
+                detail = f"{type(exc).__name__}: {exc}"
+            else:
+                logger.critical(f"[{who}] exited unexpectedly — shutting the rest down")
+                detail = "exited without raising"
+            if notifier:
+                try:
+                    await notifier.send(
+                        f"🛑 <b>{who} stopped</b>\n<code>{detail}</code>\n"
+                        f"The other components are being stopped too. Nothing is "
+                        f"watching open positions until this is restarted.")
+                except Exception:
+                    pass
+
+        # One component down means the invariants the others rely on are gone.
+        # Stop cleanly rather than trading half-supervised.
+        position_monitor.stop()
+        bare_watcher.stop()
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     except asyncio.CancelledError:
         logger.info("Tasks cancelled")

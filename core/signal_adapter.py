@@ -148,7 +148,9 @@ def adapt(res: ParsedMessage, channel_symbol: str,
             out.new_sl = a.price
         if res.intent == Intent.CLOSE_PARTIAL:
             out.close_fraction = a.fraction or 0.5
-        if res.intent == Intent.CANCEL_PENDING and a.direction:
+        if res.intent in (Intent.CANCEL_PENDING, Intent.CLOSE_ALL) and a.direction:
+            # "Close the gold buys" carries a side. _handle_close filters on it;
+            # dropping it here would close the other side of the book too.
             out.direction = a.direction.lower()
 
     return out

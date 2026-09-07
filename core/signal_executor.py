@@ -28,7 +28,19 @@ logger       = logging.getLogger(__name__)
 trades_log   = logging.getLogger("trades")   # writes to trades.log
 
 
-def order_comment(channel_id: str, signal_id: str = "", leg: str = "") -> str:
+# Appended to the broker comment of a resting order the OPERATOR manages
+# himself. The EA's stale-pending sweep skips any order carrying it.
+#
+# Gold Hunter posts limits and then says "cancel this one" explicitly. An
+# automatic sweep deleting his orders behind his back would take the trade
+# away from him seconds before he asks for it. The EA has no idea which
+# channel an order came from, so the exemption has to travel with the order,
+# and the comment is the only field that makes the round trip.
+OPERATOR_MANAGED_MARK = "~"
+
+
+def order_comment(channel_id: str, signal_id: str = "", leg: str = "",
+                  operator_managed: bool = False) -> str:
     """Broker-visible attribution tag, <= 31 chars (the MT5 comment limit).
 
     The database already records channel_id and channel_name on every signal and
@@ -55,7 +67,12 @@ def order_comment(channel_id: str, signal_id: str = "", leg: str = "") -> str:
     # comment written here shredded the orders reply and the orders pool read
     # as permanently unavailable. The bridge no longer splits on pipes, but
     # putting a delimiter character inside a payload is a trap either way.
-    return "-".join(parts)[:31]
+    out = "-".join(parts)[:31]
+    if operator_managed:
+        # Always fits: 11 + 6 + 4 + 2 hyphens = 23 at worst, so the mark is
+        # never the character truncation eats.
+        out = (out[:30] + OPERATOR_MANAGED_MARK)
+    return out
 
 
 def _floor_lot(lot: float, step: float = 0.01, min_lot: float = 0.01) -> float:
@@ -140,14 +157,27 @@ class SignalExecutor:
 
     # ── Dispatch ───────────────────────────────────────────────────────────────
 
+    # Instructions that can only ever REDUCE exposure. A halted channel must
+    # still obey these: halting is meant to bound a loss, and the operator's
+    # "close all" is the fastest way to bound it.
+    _RISK_REDUCING = {"close", "close_all", "close_partial", "breakeven",
+                      "sl_correction", "cancel_pending", "tp_hit"}
+
     async def execute(self, signal: ParsedSignal, channel: ChannelConfig,
                        message_id: int = 0):
-        if channel.halted:
+        t = signal.signal_type
+        # 2026-09-06: this gate used to sit above the whole dispatch, so a
+        # halted channel refused CLOSE as well as entries. The account guard
+        # halts all 28 channels at once and its own notification says "close
+        # them yourself if you want out" - while this line had disabled exactly
+        # that path. In the state the breaker fires, every open position lost
+        # its manual exit. Only new exposure is blocked now.
+        if channel.halted and t not in self._RISK_REDUCING:
             await self._notify(
-                f"⛔ <b>{channel.name}</b> halted (drawdown limit). Signal ignored.")
+                f"⛔ <b>{channel.name}</b> halted (drawdown limit). "
+                f"New entries ignored; close and breakeven instructions still run.")
             return
 
-        t = signal.signal_type
         try:
             if t == "entry":
                 await self._handle_entry(signal, channel, message_id)
@@ -466,13 +496,93 @@ class SignalExecutor:
         if not working_balance:
             await self._notify("⚠️ Cannot read working balance"); return
 
+        # The lot is sized as risk_amt / (sl_dist * contract * n). Only an
+        # EXACTLY zero distance used to be refused, so a stop the market had
+        # drifted to within a few cents of produced an enormous position: at
+        # sl_dist 0.50 on a $1000 book at 10% across 3 legs that is 1.98 lots,
+        # 198 ounces, and one dollar of adverse movement costs 20% of the book.
+        # MAX_LOT=10 only binds below a 3-cent stop, so it was never the guard.
+        #
+        # The parser enforces min_sl_distance against the POSTED entry; this is
+        # the same rule applied to the price we will actually pay.
+        # ── Geometry against the REAL fill, not the posted level ──────────────
+        # SignalParser.finalize_market() exists to run exactly these three
+        # checks once the fill price is known, and it has never had a caller:
+        # for every market entry, nothing verified the stop was on the correct
+        # side of the price we actually pay. The parser's own comment says so.
+        # Running the checks here keeps them next to the price they apply to.
+        _d = (direction or "").lower()
+        if (_d == "buy" and sl >= price) or (_d == "sell" and sl <= price):
+            await self._notify(
+                f"⚠️ <b>Stop is on the wrong side of the market</b> — {channel.name}\n"
+                f"{_d.upper()} {symbol} would fill near <code>{price:g}</code> with "
+                f"the stop at <code>{sl:g}</code>. The posted levels are stale — "
+                f"the market has already gone through them. Not trading it.")
+            self.db.log_skipped_signal(
+                channel.id, message_id, "entry",
+                f"stop {sl} on the wrong side of the live price {price} for a {_d}")
+            return
+        _live_tps = [t for t in (tps or []) if t]
+        if _live_tps and all(
+                (t <= price if _d == "buy" else t >= price) for t in _live_tps):
+            await self._notify(
+                f"⚠️ <b>Every target is behind the market</b> — {channel.name}\n"
+                f"{_d.upper()} {symbol} near <code>{price:g}</code>, targets "
+                f"{', '.join(f'{t:g}' for t in _live_tps)}. Nothing left to reach.")
+            self.db.log_skipped_signal(
+                channel.id, message_id, "entry",
+                f"all targets behind the live price {price} for a {_d}")
+            return
+
         sl_dist = abs(price - sl)
-        if sl_dist == 0:
-            await self._notify("⚠️ SL distance is zero"); return
+        min_dist = float((channel.parser or {}).get("min_sl_distance", 1.0) or 1.0)
+        if sl_dist < min_dist:
+            await self._notify(
+                f"⚠️ <b>Stop too close</b> — {channel.name}\n"
+                f"{symbol} at <code>{price:g}</code> is <code>{sl_dist:.2f}</code> "
+                f"from the stop <code>{sl:g}</code>, under this channel's minimum "
+                f"<code>{min_dist:g}</code>. The market has moved into the stop "
+                f"since the signal was posted. Not sizing off a distance this "
+                f"small — the lot would be enormous.")
+            self.db.log_skipped_signal(
+                channel.id, message_id, "entry",
+                f"live stop distance {sl_dist:.2f} below min_sl_distance {min_dist:g}")
+            return
 
         # Classify TPs — market or limit based on signal.entry_type
         entry_type  = signal.entry_type or "market"
         entry_price = signal.entry_price   # limit price (None = use current for market)
+
+        # ── per-channel off switch for resting orders ────────────────────────
+        # A limit that never fills is not free. It sits armed at a price the
+        # market has left, and fills on the pullback into a move that has
+        # already happened, with a stop sized for a completely different
+        # entry. Set parser.allow_limit_orders=false on a channel to take its
+        # signals at market instead, or "skip" to refuse them outright.
+        # This operator cancels his own resting orders by hand ("cancel the
+        # 4436 one"), so nothing here or in the EA may delete them behind him.
+        op_managed = bool((channel.parser or {}).get(
+            "operator_manages_limits", False))
+        allow = (channel.parser or {}).get("allow_limit_orders", True)
+        if entry_type in ("limit", "stop") and allow is not True:
+            if str(allow).lower() == "skip":
+                logger.info("[EXECUTOR] %s: resting %s order refused "
+                            "(allow_limit_orders=skip)", channel.name, entry_type)
+                try:
+                    self.db.log_skipped_signal(
+                        channel.id, message_id, "entry",
+                        f"{entry_type} order refused: allow_limit_orders=skip")
+                except Exception:
+                    pass
+                await self._notify(
+                    f"⏭️ <b>Resting order skipped</b> — {channel.name}\n"
+                    f"{direction.upper()} {symbol} at <code>{entry_price}</code> "
+                    f"was a {entry_type} order and this channel has "
+                    f"<code>allow_limit_orders</code> set to skip.")
+                return
+            logger.info("[EXECUTOR] %s: taking the %s order at market instead "
+                        "(allow_limit_orders=false)", channel.name, entry_type)
+            entry_type, entry_price = "market", None
         classified  = []
 
         for i, tp in enumerate(tps, 1):
@@ -522,9 +632,19 @@ class SignalExecutor:
                 f"(base {channel.risk_pct}%)"
             )
 
+        # ── Runner support (MUST come before sizing) ──────────────────────────
+        # "TP open" / "TP runner" means a leg with no fixed target. It used to
+        # be appended AFTER the budget was divided, so it was an extra leg at
+        # the same lot: realised risk was (N+1)/N of intended. Measured over
+        # the week of 31 Aug, 18 signals carrying a runner took 1.29x their
+        # configured risk; the worst (one target plus a runner) took 2.00x -
+        # 20% of a $1000 book on a channel set to 10%. Counting it here makes
+        # the runner share the budget like any other leg.
+        has_runner = bool(getattr(signal, "has_runner", False))
+
         # ── Lot sizing — keep risk == effective_risk_pct of working_balance ───
         risk_amt = working_balance * (effective_risk_pct / 100.0)
-        n_tps    = max(1, len(classified))
+        n_tps    = max(1, len(classified) + (1 if has_runner else 0))
         ideal_lot_per_tp = risk_amt / (sl_dist * self.contract_size * n_tps)
 
         # Floor to lot_step but DON'T let min_lot silently inflate risk
@@ -562,13 +682,14 @@ class SignalExecutor:
         # Final guard — never exceed max_lot per position
         lot_per_tp = min(lot_per_tp, self.max_lot)
 
-        # ── Runner support ────────────────────────────────────────────────────
-        # If the signal includes "TP open" / "TP runner", append a synthetic
-        # position with tp_price=None — the bridge will open with SL only.
-        # NOTE: the runner adds ~1/n_tps additional risk on top of risk_pct
-        # because it shares lot_per_tp with the other positions.
-        if getattr(signal, "has_runner", False):
-            classified.append((len(classified) + 1, None))
+        # Append the runner now that it has already been paid for above. Its
+        # index continues the ladder; _tp_passed may have dropped earlier legs,
+        # so take the highest index in use rather than the list length, which
+        # could otherwise collide with a surviving leg and put two orders at
+        # one price with a duplicate (signal_id, tp_index).
+        if has_runner:
+            _next = max([ti for ti, _ in classified], default=0) + 1
+            classified.append((_next, None))
 
         # Save signal
         signal_id = f"SIG-{message_id}-{uuid.uuid4().hex[:6].upper()}"
@@ -579,7 +700,13 @@ class SignalExecutor:
             symbol=symbol, direction=direction,
             entry_type=entry_type,
             entry_price=entry_price, stop_loss=sl,
-            take_profits=tps, status="open"
+            take_profits=tps, status="open",
+            # Carry the parser's own notes into the row. "SL synthesised at 70
+            # pips", "stop treated as a typo", "zone collapsed to a single
+            # entry" - these were being generated and then dropped, so the
+            # trades taken on an inferred stop could never be graded as their
+            # own population, which was the entire reason for tagging them.
+            notes=" | ".join(getattr(signal, "warnings", None) or []) or None
         )
 
         # Place all orders
@@ -603,6 +730,20 @@ class SignalExecutor:
             entry_type = "limit"
 
         for tp_index, tp_price in classified:
+            # halted was read once in execute(), before four awaits with 10-30
+            # second timeouts. The monitor runs every 5 seconds and the account
+            # guard halts all 28 channels at once, so a signal already in flight
+            # placed its whole batch anyway - and a 4-leg ladder spends ~40s in
+            # this loop. Re-read it between legs.
+            if channel.halted:
+                logger.warning(
+                    "[EXECUTOR] %s halted mid-batch — stopping after %d leg(s)",
+                    channel.name, len(placed))
+                await self._notify(
+                    f"⛔ <b>{channel.name}</b> halted while this signal was being "
+                    f"placed. Stopped after <b>{len(placed)}</b> leg(s); the rest "
+                    f"were not sent.")
+                break
             is_runner = tp_price is None
             leg_entry = ladder.get(tp_index) if ladder else None
             if leg_entry is not None:
@@ -618,7 +759,8 @@ class SignalExecutor:
                 # still with no take profit.
                 res = await self.bridge.place_limit_order(
                     symbol, direction, lot_per_tp, leg_entry, sl, 0.0,
-                    comment=order_comment(channel.id, signal_id, "run"))
+                    comment=order_comment(channel.id, signal_id, "run",
+                                          operator_managed=op_managed))
                 order_label = f"runner@{leg_entry:.2f}"
             elif is_runner:
                 # Runner: open with SL only, no TP (tp=0 = unlimited)
@@ -629,12 +771,14 @@ class SignalExecutor:
             elif entry_type == "limit" and entry_price:
                 res = await self.bridge.place_limit_order(
                     symbol, direction, lot_per_tp, entry_price, sl, tp_price,
-                    comment=order_comment(channel.id, signal_id, f"t{tp_index}"))
+                    comment=order_comment(channel.id, signal_id, f"t{tp_index}",
+                                          operator_managed=op_managed))
                 order_label = f"limit@{entry_price:.2f}"
             elif entry_type == "stop" and entry_price:
                 res = await self.bridge.place_stop_order(
                     symbol, direction, lot_per_tp, entry_price, sl, tp_price,
-                    comment=order_comment(channel.id, signal_id, f"t{tp_index}"))
+                    comment=order_comment(channel.id, signal_id, f"t{tp_index}",
+                                          operator_managed=op_managed))
                 order_label = f"stop@{entry_price:.2f}"
             else:
                 res = await self.bridge.place_market_order(
@@ -736,7 +880,20 @@ class SignalExecutor:
                 target_tp = live[0]
                 # A stop on the wrong side of the fill is rejected too, and
                 # would be a market order if it were not.
-                if fill and sl and self._tp_passed(direction, fill, sl):
+                #
+                # THE BUG THIS REPLACES (live 2026-08-31 to 2026-09-07).
+                # This called _tp_passed(direction, fill, sl), which asks "has
+                # price reached this TARGET" - `fill >= sl` for a buy. A buy's
+                # stop is ALWAYS below its fill, so that was always true and
+                # the guard refused every correct stop. Same inverted for a
+                # sell. Result: 72 refusals, ZERO successful upgrades, ever.
+                # Every pre-signal leg kept its blind 70-pip stop and no
+                # target while the full-size batch opened alongside it, so the
+                # channel carried both.
+                #
+                # A stop is on the wrong side when it is where the TRADE IS
+                # GOING, not where it came from.
+                if fill and sl and self._sl_wrong_side(direction, fill, sl):
                     logger.warning(
                         "[EXECUTOR] bare ticket=%s: the signal's stop %s is "
                         "already through the fill at %s — keeping the "
@@ -985,25 +1142,75 @@ class SignalExecutor:
             all_open = self.db.get_open_signals(
                 channel.id, signal.symbol if not close_all else None)
             sig_rows = all_open if close_all else all_open[:1]
+
+        # "Close the gold buys here with loss" names ONE side. The parser
+        # captures it and the adapter carries it; honouring it here is what
+        # makes a directional close safe to detect at all. Without this the
+        # instruction would flatten the other side of the book too.
+        want_dir = (getattr(signal, "direction", None) or "").lower() or None
+        if want_dir:
+            kept = [r for r in sig_rows
+                    if (r["direction"] or "").lower() == want_dir]
+            if len(kept) != len(sig_rows):
+                logger.info("[EXECUTOR] %s: directional close — %d of %d open "
+                            "signal(s) are %s, the rest are left alone",
+                            channel.name, len(kept), len(sig_rows), want_dir.upper())
+            sig_rows = kept
+
         if not sig_rows:
             await self._notify(f"⚠️ Close: no open signals for {channel.name}"); return
 
         closed = 0
+        failed = 0
         for row in sig_rows:
+            row_failed = 0
             for pos in self.db.get_open_positions(row["signal_id"]):
-                if pos["ticket"]:
-                    if await self.bridge.close_position(pos["ticket"]):
-                        self.db.update_position_closed(pos["ticket"], 0.0, "manual")
-                        trades_log.info(
-                            f"CLOSE_MANUAL channel={channel.name} "
-                            f"ticket={pos['ticket']} signal={row['signal_id']}"
-                        )
-                        closed += 1
-            self.db.update_signal_status(row["signal_id"], "closed", "manual")
+                if not pos["ticket"]:
+                    continue
+                if not await self.bridge.close_position(pos["ticket"]):
+                    failed += 1; row_failed += 1
+                    logger.error("[EXECUTOR] close FAILED on ticket=%s (signal=%s) "
+                                 "— leaving it open in the book",
+                                 pos["ticket"], row["signal_id"])
+                    continue
+                # The realised P&L was hardcoded to 0.0 here, so every
+                # operator-instructed close counted as a scratch: the drawdown
+                # breaker never saw it, the account guard never saw it, and the
+                # per-channel ledger never moved. Ask the broker what it was.
+                pnl = 0.0
+                try:
+                    deal = await self.bridge.get_deal_history(pos["ticket"])
+                    if deal and deal.get("status") == "success":
+                        for key in ("net_profit", "total_profit", "profit"):
+                            v = deal.get(key)
+                            if v is not None:
+                                pnl = float(v); break
+                except Exception as e:
+                    logger.error("[EXECUTOR] no deal history for ticket=%s after "
+                                 "a manual close: %s", pos["ticket"], e)
+                self.db.update_position_closed(pos["ticket"], pnl, "manual")
+                self.db.book_realised(channel.id, pnl, "manual close")
+                trades_log.info(
+                    f"CLOSE_MANUAL channel={channel.name} "
+                    f"ticket={pos['ticket']} signal={row['signal_id']} pnl={pnl:.2f}"
+                )
+                closed += 1
+            # Only declare the signal closed if every leg actually closed. It
+            # used to be set unconditionally, so a bridge timeout left the
+            # positions live at the broker while the signal left
+            # get_open_signals - and the operator's follow-up "close all" then
+            # answered "no open signals" with the trade still on.
+            if row_failed == 0:
+                self.db.update_signal_status(row["signal_id"], "closed", "manual")
+            else:
+                logger.warning("[EXECUTOR] signal %s kept OPEN — %d leg(s) would "
+                               "not close", row["signal_id"], row_failed)
 
         await self._notify(
             f"🔴 <b>{'Close All' if close_all else 'Close'}</b> — {channel.name}\n"
-            f"Closed {closed} position(s).")
+            f"Closed {closed} position(s)."
+            + (f"\n⚠️ <b>{failed} would NOT close</b> and are still open at the "
+               f"broker. Close them by hand." if failed else ""))
 
     # ── Partial close ─────────────────────────────────────────────────────────
 
@@ -1060,6 +1267,34 @@ class SignalExecutor:
                         pos["ticket"], full, fraction * 100, self.lot_step)
                     continue
                 if await self.bridge.close_position(pos["ticket"], lot=want):
+                    # Record what is LEFT. Without this the next partial
+                    # measured its fraction against the original size again,
+                    # so two "close 50%" instructions closed the whole
+                    # position - and the "cannot be split" guard above
+                    # compared against a stale full size and never fired.
+                    # bare_trade_watcher already does this; the executor did not.
+                    try:
+                        self.db.update_position_lot(pos["ticket"],
+                                                    round(full - want, 2))
+                    except Exception as e:
+                        logger.error("[EXECUTOR] could not record the remaining "
+                                     "lot on ticket=%s: %s", pos["ticket"], e)
+                    try:
+                        _d = await self.bridge.get_deal_history(pos["ticket"])
+                        if _d and _d.get("status") == "success":
+                            for _k in ("net_profit", "total_profit", "profit"):
+                                _v = _d.get(_k)
+                                if _v is not None:
+                                    # RUNNING TOTAL, not this slice: the EA sums
+                                    # every closing deal on the position id, so
+                                    # the second partial's reply still contains
+                                    # the first. Book the increment only.
+                                    self.db.book_position_cumulative(
+                                        pos["ticket"], channel.id, float(_v),
+                                        "partial close")
+                                    break
+                    except Exception:
+                        pass
                     trades_log.info(
                         f"CLOSE_PARTIAL channel={channel.name} "
                         f"ticket={pos['ticket']} lot={want:.2f}/{full:.2f} "
@@ -1125,23 +1360,84 @@ class SignalExecutor:
     # ── SL correction ─────────────────────────────────────────────────────────
 
     async def _handle_sl_correction(self, signal, channel):
+        """Move the stop on the trade the operator meant, not on all of them.
+
+        This used to iterate every open signal on the channel with no
+        reply_to_id scoping (which _handle_close honours), no direction filter,
+        and no never-worsen check (which _auto_breakeven has). One "SL to 4350"
+        was therefore applied to every open trade, could land on the wrong side
+        of an opposite-direction position, and could WIDEN a stop that had
+        already been tightened to breakeven.
+        """
         if not signal.new_sl:
             return
-        modified = 0
-        for row in self.db.get_open_signals(channel.id, signal.symbol):
+        new_sl = float(signal.new_sl)
+
+        # Prefer the signal the operator replied to.
+        rows = []
+        if getattr(signal, "reply_to_id", None):
+            row = self.db.get_signal_by_message(channel.id, signal.reply_to_id)
+            if row:
+                rows = [row]
+        if not rows:
+            rows = self.db.get_open_signals(channel.id, signal.symbol)
+            # With no reply and more than one live trade there is no way to know
+            # which one he means, and guessing moves a stop on a trade he was
+            # not talking about. Only act when it is unambiguous, or when the
+            # direction he named picks exactly one out.
+            want_dir = (getattr(signal, "direction", None) or "").lower()
+            if want_dir:
+                rows = [r for r in rows
+                        if str(r["direction"]).lower() == want_dir]
+            if len(rows) > 1:
+                await self._notify(
+                    f"⚠️ <b>SL → {new_sl:g} not applied</b> — {channel.name}\n"
+                    f"{len(rows)} trades are open and the instruction did not "
+                    f"reply to one of them. Moving them all could put a stop on "
+                    f"the wrong side of an opposite trade, so nothing was "
+                    f"changed. Reply to the signal, or name the direction.")
+                return
+
+        modified = skipped = 0
+        for row in rows:
+            direction = str(row["direction"] or "").lower()
             for pos in self.db.get_open_positions(row["signal_id"]):
-                if pos["ticket"]:
-                    if await self.bridge.modify_position(
-                            pos["ticket"], signal.new_sl, float(pos["tp_price"] or 0)):
-                        modified += 1
+                if not pos["ticket"]:
+                    continue
+                entry = float(pos["entry_price"] or 0)
+                cur_sl = float(pos["stop_loss"] or 0)
+                # Never through the market's own side of the entry, and never
+                # backwards. A "correction" that widens a stop is not one.
+                if direction == "buy":
+                    if new_sl >= entry > 0 or (cur_sl and new_sl < cur_sl):
+                        skipped += 1; continue
+                elif direction == "sell":
+                    if 0 < entry <= new_sl or (cur_sl and new_sl > cur_sl):
+                        skipped += 1; continue
+                if await self.bridge.modify_position(
+                        pos["ticket"], new_sl, float(pos["tp_price"] or 0)):
+                    self.db.update_position_sl(int(pos["ticket"]), new_sl)
+                    modified += 1
         await self._notify(
-            f"🛑 <b>SL → <code>{signal.new_sl:.2f}</code></b> — {channel.name}\n"
-            f"{modified} position(s) updated.")
+            f"🛑 <b>SL → <code>{new_sl:.2f}</code></b> — {channel.name}\n"
+            f"{modified} position(s) updated."
+            + (f"\n{skipped} left alone (it would have widened the stop or put "
+               f"it the wrong side of entry)." if skipped else ""))
 
     # ── Helper ─────────────────────────────────────────────────────────────────
-
     def _tp_passed(self, direction: str, price: float, tp: float) -> bool:
+        """Has price already gone through this TARGET? Buy targets sit above."""
         return price >= tp if direction == "buy" else price <= tp
+
+    def _sl_wrong_side(self, direction: str, fill: float, sl: float) -> bool:
+        """Is this STOP on the wrong side of the fill?
+
+        The mirror image of _tp_passed, and not interchangeable with it. A
+        buy's stop belongs BELOW the fill and its target ABOVE; asking the
+        target question about a stop answers "yes" for every correct stop,
+        which is what silently disabled bare upgrades for a week.
+        """
+        return sl >= fill if direction == "buy" else sl <= fill
 
     async def _notify(self, msg: str):
         if self.notifier:

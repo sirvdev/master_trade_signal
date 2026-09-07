@@ -45,6 +45,15 @@ class Notifier:
         except TelegramError as e:
             logger.error(f"[NOTIFIER] Send failed: {e}")
             return False
+        except Exception as e:
+            # Anything the telegram library does not wrap - a raw httpx error,
+            # a closed event loop during shutdown, an uninitialised Bot. Every
+            # caller in the trading path treats notification as fire-and-forget
+            # and most already wrap this call, but not all: an unhandled raise
+            # here would abort the close or the halt it was reporting on. A
+            # missed message must never cost a trade.
+            logger.error(f"[NOTIFIER] Send failed ({type(e).__name__}): {e}")
+            return False
 
     async def notify_startup(self, provider: str, channels: list) -> bool:
         ch_list = ", ".join(ch.name for ch in channels) or "none"

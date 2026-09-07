@@ -126,7 +126,43 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_pos_channel
                     ON positions(channel_id, status);
             """)
+            self._add_missing_columns(c)
         logger.info("[DB] Schema ready")
+
+    # Columns added after the first release. CREATE TABLE IF NOT EXISTS does
+    # nothing to a table that already exists, so a new column never reaches a
+    # live database without this. Purely additive: an ALTER TABLE ADD COLUMN
+    # with a default rewrites no rows and cannot lose data.
+    _ADDED_COLUMNS = {
+        "positions": [
+            # How much of this ticket's realised P&L has already been moved
+            # into channel_balances. The EA's get_deal_history returns the
+            # CUMULATIVE profit of every closing deal on a position id, so a
+            # partial close and the eventual full close both report the first
+            # slice. Booking each reply whole counted that slice twice in the
+            # ledger, and channel_balances is the risk-sizing base and the
+            # drawdown denominator: phantom credit makes a losing channel look
+            # solvent and sizes the next trade off money that does not exist.
+            ("booked_pnl", "REAL DEFAULT 0"),
+        ],
+    }
+
+    def _add_missing_columns(self, c: sqlite3.Connection):
+        for table, cols in self._ADDED_COLUMNS.items():
+            try:
+                have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            except sqlite3.Error:
+                continue
+            if not have:
+                continue
+            for name, decl in cols:
+                if name in have:
+                    continue
+                try:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    logger.info("[DB] added %s.%s", table, name)
+                except sqlite3.Error as e:
+                    logger.error("[DB] could not add %s.%s: %s", table, name, e)
 
     # ── Signals ────────────────────────────────────────────────────────────────
 
@@ -135,21 +171,29 @@ class Database:
                     raw_text: str, symbol: str, direction: Optional[str],
                     entry_type: Optional[str], entry_price: Optional[float],
                     stop_loss: Optional[float], take_profits: list,
-                    status: str = "pending", is_bare: bool = False) -> str:
+                    status: str = "pending", is_bare: bool = False,
+                    notes: Optional[str] = None) -> str:
         now = datetime.utcnow().isoformat()
         with self._conn() as c:
             c.execute("""
                 INSERT OR REPLACE INTO signals
                 (signal_id, channel_id, channel_name, message_id, reply_to_id,
                  raw_text, symbol, direction, entry_type, entry_price, stop_loss,
-                 take_profits, status, is_bare, bare_opened_at, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 take_profits, status, is_bare, bare_opened_at, created_at, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (signal_id, channel_id, channel_name, message_id, reply_to_id,
                   raw_text, symbol, direction, entry_type, entry_price, stop_loss,
                   json.dumps(take_profits), status,
                   1 if is_bare else 0,
                   now if is_bare else None,
-                  now))
+                  now,
+                  # The parser's own notes - "SL synthesised at 70 pips",
+                  # "stop treated as a typo", "zone collapsed to a single
+                  # entry" - never reached this column, so the population of
+                  # trades taken on an inferred stop could not be graded
+                  # separately after the fact. That was the whole point of
+                  # tagging them.
+                  notes))
         return signal_id
 
     def get_signal(self, signal_id: str) -> Optional[sqlite3.Row]:
@@ -172,6 +216,12 @@ class Database:
             sql += " AND channel_id=?"; args.append(channel_id)
         if symbol:
             sql += " AND symbol=?";     args.append(symbol)
+        # NEWEST FIRST, explicitly. With no ORDER BY this returned index order,
+        # so the executor's `all_open[:1]` for an unqualified "close it" picked
+        # the channel's OLDEST open signal - closing a stale trade and leaving
+        # the one the operator was talking about running, while reporting
+        # success either way.
+        sql += " ORDER BY created_at DESC, rowid DESC"
         with self._conn() as c:
             return c.execute(sql, args).fetchall()
 
@@ -226,19 +276,40 @@ class Database:
             """, (ticket, entry_price, datetime.utcnow().isoformat(), row_id))
 
     def update_position_closed(self, ticket: int, pnl: float,
-                                reason: str = "closed"):
-        now = datetime.utcnow().isoformat()
+                                reason: str = "closed",
+                                closed_at: Optional[str] = None) -> bool:
+        """closed_at defaults to NOW, but pass the BROKER's close time when the
+        deal history supplies it. get_channel_day_pnl buckets on this column, so
+        a stop hit at 23:59:58 and detected at 00:00:03 was landing in the next
+        day - after the rollover had already un-halted the channel, so the
+        breaker never saw the loss that should have tripped it.
+
+        Returns True only if THIS call performed the transition. The update is
+        conditional on the row not already being closed, so two writers racing
+        on the same ticket cannot both believe they closed it. That race is
+        real: bare_trade_watcher closes a position and books it, while the
+        monitor is part-way through a cycle holding the row it read before the
+        close. The monitor then sees the ticket missing from the live pool and
+        books the same money a second time. Gating the ledger move on this
+        return value makes the whole class of double-book impossible rather
+        than patching each caller."""
+        now = closed_at or datetime.utcnow().isoformat()
         with self._conn() as c:
-            c.execute("""
+            cur = c.execute("""
                 UPDATE positions SET status='closed', closed_at=?,
-                close_reason=?, pnl=? WHERE ticket=?
+                close_reason=?, pnl=? WHERE ticket=? AND status!='closed'
             """, (now, reason, pnl, ticket))
+            changed = cur.rowcount > 0
             # Check if whole signal is closed
             row = c.execute(
                 "SELECT signal_id FROM positions WHERE ticket=?",
                 (ticket,)).fetchone()
             if row:
                 self._maybe_close_signal(c, row["signal_id"])
+        if not changed:
+            logger.info("[DB] ticket=%s was already closed - ignoring a second "
+                        "close (%s, %+.2f)", ticket, reason, pnl or 0.0)
+        return changed
 
     def _maybe_close_signal(self, conn: sqlite3.Connection, signal_id: str):
         rows = conn.execute(
@@ -254,6 +325,103 @@ class Database:
             return c.execute(
                 "SELECT * FROM positions WHERE signal_id=? AND status='open'",
                 (signal_id,)).fetchall()
+
+    def book_realised(self, channel_id: str, pnl: float, why: str = ""):
+        """Move a channel's ledger by a realised P&L, from anywhere.
+
+        update_system_balance had exactly ONE caller - position_monitor's close
+        handler - so four other paths that realise money never touched the
+        ledger at all: the bare scale-out, the bare timeout, the executor's
+        manual close and close_partial. channel_balances therefore drifted
+        permanently above reality, and it is both the risk-sizing base
+        (_get_working_balance) and the drawdown denominator on any day where
+        channel_stats has no row yet. Route every realised P&L through here.
+        """
+        if not channel_id or not pnl:
+            return
+        # update_system_balance silently returns when the channel has no
+        # channel_balances row, which is exactly how a ledger drifts without
+        # anyone noticing. Create it from the config's starting balance if it
+        # is missing, and say so.
+        if not self.get_system_balance(str(channel_id)):
+            logger.warning("[DB] no balance ledger for channel %s — creating one "
+                           "before booking %+.2f (%s)", channel_id, pnl, why)
+            self.init_system_balance(str(channel_id), 1000.0)
+        self.update_system_balance(str(channel_id), float(pnl))
+
+    def book_position_cumulative(self, ticket: int, channel_id: str,
+                                 cumulative: float, why: str = "") -> float:
+        """Book a ticket's realised P&L when the source reports a RUNNING TOTAL.
+
+        The EA's get_deal_history sums DEAL_PROFIT over every closing deal that
+        shares a position id, so the number it returns is cumulative, not the
+        P&L of the close that just happened. Three callers were booking that
+        number whole every time they asked:
+
+            partial at +0.40R   ->  reply says  +3.00  ->  ledger +3.00
+            remainder stops out ->  reply says  -5.00  ->  ledger -5.00
+                                    (that -5.00 already contains the +3.00)
+
+        so the ledger moved -2.00 while the account moved -5.00. With N
+        partials on a ticket the first slice is counted N times. It is small
+        while partials are rare - 22 of them last week, $1.11 of drift - but
+        defaults.partial_profit now takes a slice off EVERY leg that reaches
+        0.40R, which turns a rounding error into a systematic credit. And the
+        error is always in the flattering direction, because a partial is only
+        ever taken in profit.
+
+        channel_balances is not a scoreboard. _get_working_balance sizes the
+        next trade from it and the cumulative drawdown breaker divides by it,
+        so phantom credit both oversizes the next position and delays the halt
+        that should have stopped the channel.
+
+        Returns the delta actually applied.
+        """
+        try:
+            cumulative = float(cumulative)
+        except (TypeError, ValueError):
+            return 0.0
+        with self._conn() as c:
+            row = c.execute("SELECT booked_pnl FROM positions WHERE ticket=?",
+                            (ticket,)).fetchone()
+            already = float((row["booked_pnl"] if row else 0.0) or 0.0)
+            delta = round(cumulative - already, 2)
+            if row and delta:
+                c.execute("UPDATE positions SET booked_pnl=? WHERE ticket=?",
+                          (round(cumulative, 2), ticket))
+        if not row:
+            # No row to remember against. Booking the running total blind would
+            # be the very double-count this exists to prevent, so refuse and be
+            # loud rather than quietly corrupt the risk base.
+            logger.error("[DB] no position row for ticket=%s - refusing to book "
+                         "%+.2f (%s)", ticket, cumulative, why)
+            return 0.0
+        if delta:
+            self.book_realised(channel_id, delta, why)
+        return delta
+
+    def mark_pnl_booked(self, ticket: int, delta: float):
+        """Add to a ticket's booked total without moving the ledger.
+
+        For the one path whose number is NOT a running total: an unconfirmed
+        close books the last floating P&L directly, and this records that it
+        happened so a late-arriving deal history cannot bank it a second time.
+        """
+        with self._conn() as c:
+            c.execute("UPDATE positions SET booked_pnl="
+                      "COALESCE(booked_pnl,0)+? WHERE ticket=?",
+                      (round(float(delta), 2), ticket))
+
+    def get_booked_pnl(self, ticket: int) -> float:
+        """How much of this ticket has already reached the ledger.
+
+        Non-zero means a slice of it has been taken and banked. Survives a
+        restart, which the monitor's in-memory _partial_taken set does not.
+        """
+        with self._conn() as c:
+            row = c.execute("SELECT booked_pnl FROM positions WHERE ticket=?",
+                            (ticket,)).fetchone()
+        return float((row["booked_pnl"] if row else 0.0) or 0.0)
 
     def update_position_lot(self, ticket: int, lot: float):
         """Record what is LEFT of a position after a partial close.
@@ -308,6 +476,13 @@ class Database:
         with self._conn() as c:
             return c.execute(
                 "SELECT * FROM positions WHERE ticket=?", (ticket,)).fetchone()
+
+    def get_orphan_positions(self) -> list:
+        """Rows we saved before sending, that never got a ticket back."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM positions WHERE ticket IS NULL "
+                "AND status IN ('pending','open')").fetchall()
 
     def get_all_open_positions(self, channel_id: Optional[str] = None) -> list:
         sql = "SELECT * FROM positions WHERE status='open'"
@@ -448,7 +623,10 @@ class Database:
             # Wins = at least one position closed via TP for the signal
             rows = c.execute("""
                 SELECT s.signal_id,
-                       SUM(CASE WHEN p.close_reason='tp' THEN 1 ELSE 0 END) AS tp_count,
+                       -- 'trail' is a trailing stop that closed IN PROFIT.
+                       -- It is a win, not a stop-out; counting it as the
+                       -- latter understated the win rate on every report.
+                       SUM(CASE WHEN p.close_reason IN ('tp','trail') THEN 1 ELSE 0 END) AS tp_count,
                        SUM(CASE WHEN p.close_reason='sl' THEN 1 ELSE 0 END) AS sl_count,
                        SUM(CASE WHEN p.close_reason IN ('manual','be','upgraded_to_full')
                                 THEN 1 ELSE 0 END) AS scratch_count
@@ -536,8 +714,16 @@ class Database:
                 "WHERE s.channel_id=? AND LOWER(s.direction)=LOWER(?) "
                 "  AND s.is_bare=0 "
                 "  AND (? IS NULL OR s.message_id <> ?) "
+                # A row with no ticket never reached the broker - the bridge
+                # timed out after the EA already had the command file, so we
+                # never learned the ticket. Those rows stay 'pending' forever
+                # and used to blackhole this exact stop/target combination for
+                # the channel permanently: every future repost was refused as
+                # "already live" against an order nothing was tracking.
+                # Require a real ticket before a row can block a repost.
                 "  AND EXISTS (SELECT 1 FROM positions p "
                 "              WHERE p.signal_id = s.signal_id "
+                "                AND p.ticket IS NOT NULL "
                 "                AND p.status IN ('pending','open')) "
                 "ORDER BY s.created_at DESC",
                 (channel_id, direction, exclude_message_id,

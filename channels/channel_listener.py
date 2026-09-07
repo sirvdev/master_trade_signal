@@ -271,6 +271,36 @@ class ChannelListener:
             if signal is None:
                 return          # chatter, refused, or no handler. Already logged.
 
+            # ── the AI may not INVENT a blind entry ──────────────────────────
+            # A pre-announcement opens a market order with no levels, a 70-pip
+            # protective stop and no target. It is the highest-uncertainty
+            # action the system takes, and it is the one action whose only
+            # sanity gate is vacuous: _price_is_plausible needs levels to
+            # check, and a bare call has none, so it fails open every time.
+            #
+            # The deterministic parser produced all 118 genuine bare calls and
+            # correctly abstained on all five of these, which the AI then
+            # turned into live trades:
+            #   Isabelle FX   "ASIA SESSION = 3 ROUNDS OF SELL! +340 PIPS"
+            #   Isabelle FX   "we caught TRIPLE SELL during Asia Session"
+            #   Isabelle FX   "NEXT TARGET ZONE ... waiting for price"
+            #   Mr William FX "Dont Close Buy Trade Guys"
+            #   Sabin Gold    "Breakeven Profits"
+            # A results boast, a watchlist, a hold instruction and a breakeven
+            # announcement. Blocking this costs zero genuine signals.
+            if signal.signal_type == "pre_announcement" and not bool(
+                    (self.channel.parser or {}).get("ai_pre_signal", False)):
+                why = ("the AI proposed a blind entry from a message the "
+                       "deterministic parser refused; a bare call must come "
+                       "from the strict path (parser.ai_pre_signal enables it)")
+                logger.warning(f"[{self.channel.name}] AI pre-signal REFUSED: {why}")
+                try:
+                    self.executor.db.log_skipped_signal(
+                        self.channel.id, msg.id, "ai_pre_signal", why)
+                except Exception:
+                    pass
+                return
+
             ok, why = await self._price_is_plausible(signal)
             if not ok:
                 logger.warning(f"[{self.channel.name}] AI signal REFUSED: {why}")

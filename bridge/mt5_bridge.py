@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -43,6 +44,10 @@ class MT5FileBridge:
         self.common_path    = self._find_common_path()
         self.request_counter = 0
         self._connected     = False
+        # Response files the EA wrote after we had stopped waiting. Bounded:
+        # anything older than the newest 200 timeouts has long since been
+        # swept or was never written at all.
+        self._orphan_responses: deque = deque(maxlen=200)
 
         # Shared status/session files (same prefix for EA to identify us)
         self.status_file  = self.common_path / f"mt5_status_{self.session_prefix}.txt"
@@ -173,6 +178,8 @@ class MT5FileBridge:
         if self.demo_mode:
             return await self._demo_command(command)
 
+        self._sweep_orphans()
+
         async with _get_lock():
             self.request_counter += 1
             request_id = f"{self.session_id}_{self.request_counter}"
@@ -222,9 +229,38 @@ class MT5FileBridge:
             resp_file.unlink(missing_ok=True)
             return parsed
 
+        # Timed out. Two pieces of cleanup, both of which matter.
+        #
+        # 1. The COMMAND file. The EA claims a command with FileMove and there
+        #    is no staleness check on its side, so anything still sitting in
+        #    Common Files when the terminal restarts is executed then - a
+        #    market order decided hours ago, filled at whatever gold is worth
+        #    on restart, with no row on our side because we already gave up on
+        #    it. Deleting it here bounds that window to the timeout. If the EA
+        #    has already claimed the file this unlink is a no-op and the
+        #    command runs exactly as it does today.
+        # 2. The RESPONSE file. If the EA answers after the deadline it writes
+        #    one we will never read. Remember it and sweep it on a later call,
+        #    so Common Files does not accumulate a file per timeout forever.
+        cmd_file.unlink(missing_ok=True)
         resp_file.unlink(missing_ok=True)
+        self._orphan_responses.append(resp_file)
         logger.error(f"[BRIDGE] {request_id} ({command.get('action')}) timed out after {timeout}s")
         return {"status": "error", "error": "timeout"}
+
+    def _sweep_orphans(self):
+        """Delete response files that arrived after we stopped waiting.
+
+        Only ever our own session's, and only ones we timed out on, so this
+        cannot touch an in-flight reply or another instance's file.
+        """
+        for _ in range(len(self._orphan_responses)):
+            p = self._orphan_responses.popleft()
+            try:
+                if p.exists():
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # ── Public API ─────────────────────────────────────────────────────────────
 

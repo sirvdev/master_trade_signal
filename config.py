@@ -53,6 +53,12 @@ class ChannelConfig:
     #   buffer_pips         : move to entry +/- this, not exactly entry
     # Empty dict = operator message only, which is the old behaviour.
     breakeven:           dict  = field(default_factory=dict)
+    # Per-channel partial-profit policy:
+    #   at_r     : bank a slice once the leg is this many R in its own favour
+    #              (R = its own entry-to-stop distance). 0 disables.
+    #   fraction : how much of the leg to take.
+    # The stop is NOT moved, so the remainder runs exactly as it would have.
+    partial_profit:      dict  = field(default_factory=dict)
 
 
 @dataclass
@@ -132,6 +138,8 @@ def _load_channels() -> list[ChannelConfig]:
                 parser            = merged_parser,
                 breakeven         = {**(data.get('defaults', {}).get('breakeven', {}) or {}),
                                      **(ch.get('breakeven') or {})},
+                partial_profit    = {**(data.get('defaults', {}).get('partial_profit', {}) or {}),
+                                     **(ch.get('partial_profit') or {})},
                 id                = str(ch["id"]),
                 name              = ch.get("name", str(ch["id"])),
                 symbol            = ch.get("symbol", "XAUUSD"),
